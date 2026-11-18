@@ -1,0 +1,17 @@
+# 忽略构建产物
+target/
+
+# 忽略开发过程中产生的备份文件
+*_pre_*
+*_backup*
+*_old_*
+*.bak
+*.bak_*
+main_v1_backup.rs
+
+# 忽略 IDE / 系统文件
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+.DS_Store
