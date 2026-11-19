@@ -130,6 +130,24 @@ struct App {
     io_date: String,
     io_msg: String,
 
+    // 周/月视图切换（false=月视图, true=周视图）
+    week_view: bool,
+    // 待办添加栏时间段输入
+    add_start: String,
+    add_end: String,
+    // 课程表单
+    course_open: bool,
+    course_edit_id: Option<u64>,
+    course_name: String,
+    course_wd: u8,
+    course_start: String,
+    course_end: String,
+    course_place: String,
+    focus_course: bool,
+    // 时间段设置面板
+    slot_open: bool,
+    slot_draft: Vec<(String, String)>,
+
     // 右键菜单
     show_ctx: bool,
     ctx_pos: Pos2,
@@ -218,6 +236,19 @@ impl App {
             io_format: IoFormat::Markdown,
             io_date: dkey(&today),
             io_msg: String::new(),
+            week_view: false,
+            add_start: String::new(),
+            add_end: String::new(),
+            course_open: false,
+            course_edit_id: None,
+            course_name: String::new(),
+            course_wd: 1,
+            course_start: "08:00".into(),
+            course_end: "09:40".into(),
+            course_place: String::new(),
+            focus_course: false,
+            slot_open: false,
+            slot_draft: Vec::new(),
             show_ctx: false,
             ctx_pos: egui::pos2(0.0, 0.0),
             ctx_kind: CtxKind::None,
@@ -261,6 +292,7 @@ impl App {
         self.db.todos.push(Todo {
             id: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64,
             date: dkey(&self.selected), text, prio: self.add_prio, done: false,
+            start: self.add_start.trim().to_string(), end: self.add_end.trim().to_string(),
         });
         self.add_text.clear();
         self.save_later();
@@ -296,6 +328,64 @@ impl App {
         if !self.add_open { self.form_anim = 0.0; }
         self.add_open = true;
         self.focus_add = true;
+        self.add_start.clear(); self.add_end.clear();
+    }
+    /// 切换周/月视图：周视图按周翻页，月视图按月翻页
+    fn shift_page(&mut self, delta: i32) {
+        if self.week_view {
+            self.view = self.view + Duration::days(7 * delta as i64);
+            self.selected = self.view;
+        } else { self.shift_month(delta); }
+        self.month_anim = 0.0;
+    }
+    // ── 课程表单 ──
+    fn open_course_form(&mut self, id: Option<u64>) {
+        self.course_open = true; self.focus_course = true; self.course_edit_id = id;
+        if let Some(id) = id {
+            if let Some(c) = self.db.courses.iter().find(|c| c.id == id).cloned() {
+                self.course_name = c.name; self.course_wd = c.weekday;
+                self.course_start = c.start; self.course_end = c.end; self.course_place = c.place;
+            }
+        } else {
+            self.course_name.clear(); self.course_wd = (self.selected.weekday().num_days_from_sunday() as u8);
+            self.course_start = "08:00".into(); self.course_end = "09:40".into(); self.course_place.clear();
+        }
+    }
+    fn save_course(&mut self) {
+        let name = self.course_name.trim();
+        if name.is_empty() { return; }
+        let st = self.course_start.trim().to_string();
+        let en = self.course_end.trim().to_string();
+        if st.is_empty() || en.is_empty() { return; }
+        if let Some(id) = self.course_edit_id.take() {
+            if let Some(c) = self.db.courses.iter_mut().find(|c| c.id == id) {
+                c.name = name.to_string(); c.weekday = self.course_wd;
+                c.start = st; c.end = en; c.place = self.course_place.trim().to_string();
+            }
+        } else {
+            self.db.courses.push(data::Course {
+                id: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64,
+                name: name.to_string(), weekday: self.course_wd, start: st, end: en,
+                place: self.course_place.trim().to_string(),
+            });
+        }
+        self.course_open = false; self.save_later();
+    }
+    fn import_courses(&mut self) {
+        if let Some(path) = rfd::FileDialog::new().set_title("选择课表 JSON 文件").add_filter("JSON", &["json"]).pick_file() {
+            match std::fs::read_to_string(&path) {
+                Ok(txt) => match data::import_courses(&txt) {
+                    Ok(mut cs) => {
+                        let n = cs.len();
+                        self.db.courses.append(&mut cs);
+                        self.io_msg = format!("课表导入完成: {} 节课", n);
+                        self.save_later();
+                    }
+                    Err(e) => self.io_msg = format!("课表解析失败: {}", e),
+                },
+                Err(e) => self.io_msg = format!("读取失败: {}", e),
+            }
+        }
     }
 
     fn save_plan(&mut self) {
@@ -332,7 +422,9 @@ impl App {
     fn goto_today(&mut self) {
         self.today = Local::now().date_naive();
         self.selected = self.today;
-        self.view = NaiveDate::from_ymd_opt(self.today.year(), self.today.month(), 1).unwrap();
+        // 月视图 view=月初；周视图 view=今天（draw_week_view 会算出所在周的周日）
+        if self.week_view { self.view = self.today; }
+        else { self.view = NaiveDate::from_ymd_opt(self.today.year(), self.today.month(), 1).unwrap(); }
         self.month_anim = 0.0;
         self.select_pulse = 0.0;
     }
@@ -783,13 +875,19 @@ impl App {
 
         // ① 头部（固定高度，不参与滚动）
         ui.horizontal(|ui| {
-            ui.label(RichText::new(format!("{}年{}月", self.view.year(), self.view.month()))
-                .font(FontId::proportional(28.0)).color(c(theme::TEXT)));
+            let title_txt = if self.week_view {
+                let back = if self.db.week_start_sunday { self.view.weekday().num_days_from_sunday() as i64 }
+                           else { self.view.weekday().num_days_from_monday() as i64 };
+                let w0 = self.view - Duration::days(back);
+                let w6 = w0 + Duration::days(6);
+                format!("{}月{}日 – {}月{}日", w0.month(), w0.day(), w6.month(), w6.day())
+            } else { format!("{}年{}月", self.view.year(), self.view.month()) };
+            ui.label(RichText::new(title_txt).font(FontId::proportional(26.0)).color(c(theme::TEXT)));
             let ly = solar2lunar(&NaiveDate::from_ymd_opt(self.view.year(), self.view.month(), 15).unwrap());
             ui.label(RichText::new(format!("{}年·{}", year_gz(&ly), animal(&ly))).size(10.5).color(c(theme::TEXT3)));
             // 翻页按钮贴内容区右缘 = 日历周六列右缘（right_to_left 保证不被裁）
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.add_sized([28.0, 26.0], egui::Button::new("›")).clicked() { self.shift_month(1); }
+                if ui.add_sized([28.0, 26.0], egui::Button::new("›")).clicked() { self.shift_page(1); }
                 if self.jump_open {
                     let resp = ui.add_sized([126.0, 26.0], egui::TextEdit::singleline(&mut self.jump_text)
                         .id_source("jump_inline_edit").hint_text("YYYY-MM-DD 回车"));
@@ -806,17 +904,65 @@ impl App {
                 } else if ui.add_sized([52.0, 26.0], egui::Button::new("跳转")).on_hover_text("输入日期跳转").clicked() {
                     self.jump_open = true; self.jump_text = String::new(); self.focus_jump = true;
                 }
-                if ui.add_sized([28.0, 26.0], egui::Button::new("‹")).clicked() { self.shift_month(-1); }
-                if ui.add_sized([52.0, 26.0], egui::Button::new("导入/导出")).on_hover_text("导入导出日/周/月/年计划").clicked() {
+                if ui.add_sized([28.0, 26.0], egui::Button::new("‹")).clicked() { self.shift_page(-1); }
+                if ui.add_sized([52.0, 26.0], egui::Button::new("设置")).on_hover_text("排序规则 / 周起点 / 导入导出 / 课表").clicked() {
                     self.io_open = !self.io_open;
+                }
+                // right_to_left：后写的显示在更左侧
+                if ui.add_sized([44.0, 26.0], egui::Button::new(if self.week_view { "周" } else { "月" })
+                    .frame(true)).on_hover_text("切换月视图 / 周视图").clicked() {
+                    self.week_view = !self.week_view;
+                    if self.week_view { self.view = self.selected; } // 切到周视图时定位到选中日期所在周
+                }
+                if ui.add_sized([44.0, 26.0], egui::Button::new("课程")).on_hover_text("管理每周重复课程").clicked() {
+                    self.open_course_form(None);
+                }
+                if ui.add_sized([44.0, 26.0], egui::Button::new("时段")).on_hover_text("自定义周视图时间段").clicked() {
+                    self.slot_draft = self.db.slots().into_iter().map(|s| (s.start, s.end)).collect();
+                    self.slot_open = !self.slot_open;
                 }
             });
         });
         // ◀ 单独绑定（上面占位，这里补事件不便，统一在下方处理）
-        // ── 导入导出面板 ──
+        // ── 设置面板：排序 / 周起点 / 颜色 / 导入导出 ──
         if self.io_open {
             egui::Frame::none().fill(c(theme::CARD)).rounding(Rounding::same(radius::SM))
-                .inner_margin(Margin::symmetric(8.0, 5.0)).show(ui, |ui| {
+                .inner_margin(Margin::symmetric(8.0, 6.0)).show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("设 置").size(12.0).strong().color(c(theme::ACCENT2)));
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.button("×").clicked() { self.io_open = false; }
+                        });
+                    });
+                    // 排序规则：每日计划 / 每日日程表各自独立
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("排序:").size(11.0).color(c(theme::TEXT2)));
+                        ui.label(RichText::new("计划").size(11.0).color(c(theme::TEXT3)));
+                        for (i, (nm, v)) in [("按重要度", false), ("按时间", true)].iter().enumerate() {
+                            let _ = i;
+                            if ui.add(egui::Button::new(RichText::new(*nm).size(10.5))
+                                .frame(self.db.by_time == *v)).clicked() { self.db.by_time = *v; self.save_later(); }
+                        }
+                        ui.add_space(8.0);
+                        ui.label(RichText::new("日程").size(11.0).color(c(theme::TEXT3)));
+                        for (nm, v) in [("按时间", true), ("按重要度", false)].iter() {
+                            if ui.add(egui::Button::new(RichText::new(*nm).size(10.5))
+                                .frame(self.db.schedule_by_time == *v)).clicked() { self.db.schedule_by_time = *v; self.save_later(); }
+                        }
+                    });
+                    // 周视图：一周起点 + 方块颜色跟随日程
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("周视图:").size(11.0).color(c(theme::TEXT2)));
+                        for (nm, v) in [("周一起", false), ("周日起", true)].iter() {
+                            if ui.add(egui::Button::new(RichText::new(*nm).size(10.5))
+                                .frame(self.db.week_start_sunday == *v)).clicked() { self.db.week_start_sunday = *v; self.save_later(); }
+                        }
+                        ui.add_space(8.0);
+                        if ui.add(egui::Checkbox::new(&mut self.db.color_by_schedule,
+                            RichText::new("方块颜色跟随日程").size(11.0))).changed() { self.save_later(); }
+                    });
+                    section_rule(ui);
+                    // ── 导入导出（原有功能全部保留）──
                     // 第一行：范围 + 日期
                     ui.horizontal(|ui| {
                         ui.label(RichText::new("范围:").size(11.0).color(c(theme::TEXT2)));
@@ -871,11 +1017,84 @@ impl App {
                                 self.io_msg = "已取消导入".into();
                             }
                         }
+                        if ui.button("导入课表…").on_hover_text("从 JSON 导入每周重复课程").clicked() { self.import_courses(); }
+                        if ui.button("课表模板…").on_hover_text("导出一份带示例的课表 JSON").clicked() {
+                            let tpl = r#"{"courses":[{"name":"高等数学","weekday":1,"start":"08:00","end":"09:40","place":"A301"},{"name":"英语","weekday":2,"start":"10:00","end":"11:40","place":"B205"}]}"#;
+                            if let Some(path) = rfd::FileDialog::new().set_title("保存课表模板").set_file_name("planum_courses.json")
+                                .add_filter("JSON", &["json"]).save_file() {
+                                match std::fs::write(&path, tpl) {
+                                    Ok(_) => self.io_msg = format!("模板已保存: {}", path.file_name().unwrap_or_default().to_string_lossy()),
+                                    Err(e) => self.io_msg = format!("保存失败: {}", e),
+                                }
+                            }
+                        }
                         if ui.button("×").clicked() { self.io_open = false; }
                     });
                     if !self.io_msg.is_empty() {
                         ui.label(RichText::new(&self.io_msg).size(10.5).color(c(theme::MINT)));
                     }
+                });
+        }
+        // ── 课程表单 ──
+        if self.course_open {
+            egui::Frame::none().fill(c(theme::CARD)).rounding(Rounding::same(radius::SM))
+                .inner_margin(Margin::symmetric(8.0, 6.0)).show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(if self.course_edit_id.is_some() { "编辑课程" } else { "添加课程" })
+                            .size(12.0).strong().color(c(theme::ACCENT2)));
+                        ui.label(RichText::new("星期:").size(11.0).color(c(theme::TEXT2)));
+                        for wd in 0u8..7 {
+                            let on = self.course_wd == wd;
+                            if ui.add(egui::Button::new(RichText::new(["日","一","二","三","四","五","六"][wd as usize]).size(11.0))
+                                .frame(on)).clicked() { self.course_wd = wd; }
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        let r = ui.add(egui::TextEdit::singleline(&mut self.course_name)
+                            .hint_text("课程名，如「高等数学」").desired_width((ui.available_width()-240.0).max(80.0)));
+                        if self.focus_course { r.request_focus(); self.focus_course = false; }
+                        ui.add(egui::TextEdit::singleline(&mut self.course_start).hint_text("08:00").desired_width(56.0));
+                        ui.label(RichText::new("–").size(11.0).color(c(theme::TEXT3)));
+                        ui.add(egui::TextEdit::singleline(&mut self.course_end).hint_text("09:40").desired_width(56.0));
+                        ui.add(egui::TextEdit::singleline(&mut self.course_place).hint_text("地点").desired_width(70.0));
+                    });
+                    ui.horizontal(|ui| {
+                        if ui.button("保存").clicked() { self.save_course(); }
+                        if self.course_edit_id.is_some() && ui.button("删除").clicked() {
+                            if let Some(id) = self.course_edit_id.take() { self.db.courses.retain(|c| c.id != id); self.save_later(); }
+                            self.course_open = false;
+                        }
+                        if ui.button("取消").clicked() { self.course_open = false; self.course_edit_id = None; }
+                    });
+                });
+        }
+        // ── 时间段设置 ──
+        if self.slot_open {
+            egui::Frame::none().fill(c(theme::CARD)).rounding(Rounding::same(radius::SM))
+                .inner_margin(Margin::symmetric(8.0, 6.0)).show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("周视图时间段（每天卡片数量一致）").size(12.0).strong().color(c(theme::ACCENT2)));
+                        if ui.button("+ 添加").clicked() { self.slot_draft.push(("19:00".into(), "21:00".into())); }
+                    });
+                    let mut rm = None;
+                    for (i, (st, en)) in self.slot_draft.iter_mut().enumerate() {
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new(format!("{}.", i+1)).size(11.0).color(c(theme::TEXT3)));
+                            ui.add(egui::TextEdit::singleline(st).desired_width(62.0));
+                            ui.label(RichText::new("–").size(11.0).color(c(theme::TEXT3)));
+                            ui.add(egui::TextEdit::singleline(en).desired_width(62.0));
+                            if ui.button("×").clicked() { rm = Some(i); }
+                        });
+                    }
+                    if let Some(i) = rm { self.slot_draft.remove(i); }
+                    ui.horizontal(|ui| {
+                        if ui.button("保存时间段").clicked() {
+                            self.db.slots = self.slot_draft.iter().map(|(a,b)| data::Slot { start: a.clone(), end: b.clone() }).collect();
+                            self.save_later(); self.slot_open = false;
+                        }
+                        if ui.button("恢复默认").clicked() { self.slot_draft = data::default_slots().into_iter().map(|s|(s.start,s.end)).collect(); }
+                        if ui.button("取消").clicked() { self.slot_open = false; }
+                    });
                 });
         }
         // 图例
@@ -890,7 +1109,7 @@ impl App {
         let avail_h = ui.available_height();
         let cal_h = (avail_h * 0.64).clamp(200.0, (avail_h - 170.0).max(200.0));
         let cal_top = ui.cursor().top();
-        self.calendar(ui, width, cal_h);
+        if self.week_view { self.draw_week_view(ui, width, cal_h); } else { self.calendar(ui, width, cal_h); }
         let cal_bottom = ui.cursor().top();
 
         // 月份切换淡入遮罩（不拦截事件，只画在 painter 层）
@@ -907,6 +1126,135 @@ impl App {
         egui::ScrollArea::vertical().id_source("day_agenda_scroll")
             .max_height(remain).auto_shrink([false, false])
             .show(ui, |ui| self.agenda_panel(ui));
+    }
+
+    // ═══════════ 周视图：7 列（周日→周六），每列按自定义时间段切卡片 ═══════════
+    fn draw_week_view(&mut self, ui: &mut egui::Ui, width: f32, cal_h: f32) {
+        let slots = self.db.slots();
+        let nslot = slots.len().max(1);
+        // 一周起点：随开关（周日起 / 周一起）
+        let sun_first = self.db.week_start_sunday;
+        let back = if sun_first { self.view.weekday().num_days_from_sunday() as i64 }
+                   else { self.view.weekday().num_days_from_monday() as i64 };
+        let week_start = self.view - Duration::days(back);
+        let days: Vec<NaiveDate> = (0..7).map(|i| week_start + Duration::days(i)).collect();
+        let gap = 3.0;
+        let lab_w = 46.0f32; // 最左侧独立时段列，不再压周日列
+        let col_w = (width - lab_w - gap * 7.0) / 7.0;
+        let head_h = 24.0;
+        let all_day_h = 30.0;
+        let slot_h = ((cal_h - head_h - all_day_h) / nslot as f32).max(18.0);
+
+        // ── 星期表头 ──
+        // 关键：时段标签/日期列都以表头「时段」格子的实际 left 为基准，
+        // 不能用 area_x(ui)（那是 clip 左缘≈窗口最左，会把 8:00 画到软件最左侧）
+        let mut base_x = ui.cursor().left();
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = gap;
+            // 第一格：时段列表头
+            let (lab_rect, _) = ui.allocate_exact_size(Vec2::new(lab_w, head_h), egui::Sense::hover());
+            base_x = lab_rect.left();
+            ui.painter().text(lab_rect.center(), Align2::CENTER_CENTER, "时段",
+                FontId::proportional(11.0), c(theme::TEXT3));
+            for (i, d) in days.iter().enumerate() {
+                let wd = d.weekday().num_days_from_sunday() as u8; // 真实星期：0=周日
+                let (rect, _) = ui.allocate_exact_size(Vec2::new(col_w, head_h), egui::Sense::hover());
+                let is_today = *d == self.today;
+                let is_sel = *d == self.selected;
+                let fill = if is_today { c(theme::ACCENT) }
+                           else if is_sel { ca(theme::ACCENT2, 60) }
+                           else { c(theme::CARD) };
+                ui.painter().rect_filled(rect, Rounding::same(radius::SM), fill);
+                let col = if is_today { c("#10131a") } else { c(theme::TEXT) };
+                ui.painter().text(rect.center(), Align2::CENTER_CENTER,
+                    format!("{} {}", WEEK[wd as usize], d.day()), FontId::proportional(12.0), col);
+            }
+        });
+
+        // ── 时间段网格 ──
+        let grid_top = ui.cursor().top();
+        for (si, slot) in slots.iter().enumerate() {
+            let yt = grid_top + si as f32 * slot_h;
+            let cell_rect = egui::Rect::from_min_size(Pos2::new(base_x, yt), Vec2::new(lab_w, slot_h - gap));
+            ui.painter().rect_filled(cell_rect, Rounding::same(2.0), ca(theme::BG, 120));
+            // 时段标签：起止时间在方块内上下居中、拉开距离（约 1/3 与 2/3 高度处）
+            let cx = cell_rect.center().x;
+            let y1 = cell_rect.top() + cell_rect.height() / 3.0;
+            let y2 = cell_rect.top() + cell_rect.height() * 2.0 / 3.0;
+            ui.painter().text(Pos2::new(cx, y1), Align2::CENTER_CENTER, &slot.start,
+                FontId::proportional(10.5), c(theme::TEXT));
+            ui.painter().text(Pos2::new(cx, y2), Align2::CENTER_CENTER, &slot.end,
+                FontId::proportional(10.5), c(theme::TEXT2));
+        }
+        // 每天的内容：课程 + 时段待办，按格子落位（用 allocate_ui_at_rect 保证坐标精确）
+        for (di, d) in days.iter().enumerate() {
+            let dk = dkey(d);
+            let wd = d.weekday().num_days_from_sunday() as u8; // 真实星期：0=周日
+            let x = base_x + lab_w + gap + di as f32 * (col_w + gap);
+            // 该天所有有时段的项：课程 + 待办
+            struct Item { start: String, end: String, text: String, color: Color32, is_course: bool }
+            let mut items: Vec<Item> = Vec::new();
+            for co in self.db.courses_on(wd) {
+                items.push(Item { start: co.start.clone(), end: co.end.clone(),
+                    text: co.name.clone(), color: c(theme::ACCENT2), is_course: true });
+            }
+            for t in self.db.todos_of(&dk) {
+                if !t.start.is_empty() {
+                    items.push(Item { start: t.start.clone(), end: t.end.clone(), text: t.text.clone(),
+                        color: if t.done { c(theme::DONE) } else { rgb(prio_color(t.prio)) }, is_course: false });
+                }
+            }
+            for (si, slot) in slots.iter().enumerate() {
+                let cell_top = grid_top + si as f32 * slot_h + 1.0;
+                let cr = egui::Rect::from_min_size(Pos2::new(x, cell_top), Vec2::new(col_w, slot_h - gap - 2.0));
+                let in_slot: Vec<&Item> = items.iter().filter(|it| {
+                    // 项的开始时间落在本段 [start,end) 内
+                    it.start.as_str() >= slot.start.as_str() && it.start.as_str() < slot.end.as_str()
+                }).collect();
+                // 方块增强：有内容的格子画圆角卡片；颜色可跟随日程/优先级
+                if !in_slot.is_empty() {
+                    let first_col = in_slot[0].color;
+                    let (fill, stroke_col) = if self.db.color_by_schedule {
+                        (Color32::from_rgba_unmultiplied(first_col.r(), first_col.g(), first_col.b(), 46),
+                         Color32::from_rgba_unmultiplied(first_col.r(), first_col.g(), first_col.b(), 150))
+                    } else {
+                        (ca(theme::CARD, 210), c(theme::STROKE))
+                    };
+                    ui.painter().rect_filled(cr, Rounding::same(4.0), fill);
+                    ui.painter().rect_stroke(cr, Rounding::same(4.0), Stroke::new(1.0, stroke_col));
+                }
+                ui.allocate_ui_at_rect(cr, |ui| {
+                    ui.spacing_mut().item_spacing.y = 1.0;
+                    for it in in_slot.iter().take(3) {
+                        let label = trunc_to_width(ui, &it.text, FontId::proportional(9.5), col_w - 5.0);
+                        let line = if it.end.is_empty() { label } else { format!("{} {}", it.start, label) };
+                        let txt = if it.is_course { RichText::new(line).size(9.5).color(it.color).strong() }
+                                  else { RichText::new(line).size(9.5).color(it.color) };
+                        ui.add(egui::Label::new(txt).truncate());
+                    }
+                    if in_slot.len() > 3 { ui.label(RichText::new(format!("+{}", in_slot.len()-3)).size(8.5).color(c(theme::TEXT3))); }
+                });
+            }
+            // 全天待办区：该天未设时段的待办（最多 2 条 + N）
+            let all_todos: Vec<_> = self.db.todos_of(&dk).into_iter().filter(|t| t.start.is_empty()).collect();
+            let ar = egui::Rect::from_min_size(Pos2::new(x, grid_top + nslot as f32 * slot_h + 1.0), Vec2::new(col_w, all_day_h - 4.0));
+            ui.allocate_ui_at_rect(ar, |ui| {
+                ui.spacing_mut().item_spacing.y = 0.0;
+                ui.label(RichText::new("全天").size(8.5).color(c(theme::TEXT3)));
+                for t in all_todos.iter().take(2) {
+                    let label = trunc_to_width(ui, &t.text, FontId::proportional(9.0), col_w - 5.0);
+                    ui.label(RichText::new(label).size(9.0).color(if t.done { c(theme::DONE) } else { rgb(prio_color(t.prio)) }));
+                }
+                if all_todos.len() > 2 { ui.label(RichText::new(format!("+{}", all_todos.len()-2)).size(8.0).color(c(theme::TEXT3))); }
+            });
+            // 点击整列选中那天（用最底部一个透明响应区覆盖整列）
+            let col_rect = egui::Rect::from_min_size(Pos2::new(x, grid_top - head_h), Vec2::new(col_w, head_h + nslot as f32 * slot_h + all_day_h));
+            let resp = ui.interact(col_rect, ui.id().with(("week_col", di)), egui::Sense::click());
+            if resp.clicked() { self.select(*d); }
+        }
+        // 推进 cursor 到网格底部，供下方详情布局
+        let bottom = grid_top + nslot as f32 * slot_h + all_day_h;
+        ui.allocate_space(Vec2::new(0.0, (bottom - ui.cursor().top()).max(0.0)));
     }
 
     fn calendar(&mut self, ui: &mut egui::Ui, width: f32, cal_h: f32) {
@@ -1121,8 +1469,12 @@ impl App {
                                 ["", "高", "中", "低"][p as usize])).color(rgb(prio_color(p))).size(11.0);
                             if ui.add(egui::Button::new(label).frame(false)).clicked() { self.add_prio = p; }
                         }
+                        // 时间段输入（可留空=全天）
+                        ui.add(egui::TextEdit::singleline(&mut self.add_start).hint_text("起").desired_width(38.0));
+                        ui.label(RichText::new("–").size(10.0).color(c(theme::TEXT3)));
+                        ui.add(egui::TextEdit::singleline(&mut self.add_end).hint_text("止").desired_width(38.0));
                         let resp = ui.add(egui::TextEdit::singleline(&mut self.add_text)
-                            .hint_text("写下计划事项，回车添加…").desired_width((ui.available_width() - 56.0).max(40.0)));
+                            .hint_text("写下计划事项，回车添加…").desired_width((ui.available_width() - 46.0).max(40.0)));
                         if self.focus_add { resp.request_focus(); self.focus_add = false; }
                         // 单行 TextEdit 收到 Enter 会先 surrender_focus，必须用 lost_focus 判定；
                         // 内容为空时把焦点要回来，让用户能继续输入
@@ -1135,18 +1487,25 @@ impl App {
         }
 
         let k = dkey(&self.selected);
-        let todos = self.db.todos_of(&k);
+        // ════════ 每日详情左右分栏：左=每日计划(按重要度)，右=每日日程表(按时间) ════════
+        // 用 egui 原生 ui.columns 分栏，自动处理 ScrollArea 内坐标，最可靠
+        let todos: Vec<Todo> = self.db.todos_of(&k).into_iter().cloned().collect();
         let mut pending_toggle: Vec<(u64, bool)> = Vec::new();
         let mut pending_del: Vec<u64> = Vec::new();
         let mut pending_edit: Vec<(u64, String)> = Vec::new();
         let mut pending_prio: Vec<(u64, u8)> = Vec::new();
         let mut pending_edit_open: Vec<u64> = Vec::new();
         let mut pending_ctx: Option<Pos2> = None;
+        // ── 左右分栏（egui columns）──
+        ui.columns(2, |cols| {
+        // 左栏：每日计划
+        let ui = &mut cols[0];
+        ui.label(RichText::new("每日计划").size(12.0).strong().color(c(theme::ACCENT2)));
         if todos.is_empty() {
             ui.label(RichText::new("这一天还没有计划。右键面板打开添加栏，选好优先级写入安排；连续多日的安排请用左侧「阶段计划」创建。")
                 .size(12.0).color(c(theme::TEXT3)));
         } else {
-            for t in todos {
+            for t in &todos {
                 let mut done = t.done;
                 let is_sel = self.sel_todo == Some(t.id);
                 let is_editing = self.edit_todo == Some(t.id);
@@ -1185,13 +1544,16 @@ impl App {
                             .fill(fill_col)
                             .rounding(Rounding::same(radius::SM))
                             .inner_margin(Margin::symmetric(6.0, 3.0));
+                        let disp = if t.start.is_empty() { t.text.clone() }
+                                   else if t.end.is_empty() { format!("[{}] {}", t.start, t.text) }
+                                   else { format!("[{}-{}] {}", t.start, t.end, t.text) };
                         let style = if t.done {
-                            RichText::new(&t.text).size(13.0).color(c(theme::TEXT3)).strikethrough()
+                            RichText::new(&disp).size(13.0).color(c(theme::TEXT3)).strikethrough()
                         } else if is_sel {
                             // 选中：提亮到近白 + 加粗字重
-                            RichText::new(&t.text).size(13.5).color(c(theme::TEXT)).strong()
+                            RichText::new(&disp).size(13.5).color(c(theme::TEXT)).strong()
                         } else {
-                            RichText::new(&t.text).size(13.0).color(c(theme::TEXT2))
+                            RichText::new(&disp).size(13.0).color(c(theme::TEXT2))
                         };
                         frame.show(ui, |ui| {
                             ui.set_width(content_w - 12.0);
@@ -1235,6 +1597,40 @@ impl App {
                 });
             }
         }
+        // 右栏：每日日程表（课程 + 带时段待办，按时间排序）
+        let ui = &mut cols[1];
+        ui.label(RichText::new("每日日程表").size(12.0).strong().color(c(theme::MINT)));
+            // 课程 + 带时段待办，按开始时间排序
+            #[derive(Clone)] struct Row { start: String, end: String, text: String, col: Color32, course: bool, id: u64 }
+            let mut rows: Vec<Row> = Vec::new();
+            for c0 in self.db.courses_on(self.selected.weekday().num_days_from_sunday() as u8) {
+                rows.push(Row { start:c0.start.clone(), end:c0.end.clone(), text:c0.name.clone(),
+                    col:c(theme::ACCENT2), course:true, id:c0.id });
+            }
+            for t in self.db.todos_of(&k) {
+                if !t.start.is_empty() {
+                    rows.push(Row { start:t.start.clone(), end:t.end.clone(), text:t.text.clone(),
+                        col:if t.done { c(theme::DONE) } else { rgb(prio_color(t.prio)) }, course:false, id:t.id });
+                }
+            }
+            if self.db.schedule_by_time { rows.sort_by(|a,b| a.start.cmp(&b.start).then(a.id.cmp(&b.id))); }
+            else { rows.sort_by(|a,b| b.course.cmp(&a.course).then(a.id.cmp(&b.id))); }
+            if rows.is_empty() {
+                ui.label(RichText::new("今天没有时段安排。课程按周重复，带时段的待办会自动出现在这里。")
+                    .size(11.0).color(c(theme::TEXT3)));
+            }
+            let mut edit_course_click: Option<u64> = None;
+            for r0 in &rows {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(format!("{}-{}", r0.start, r0.end)).size(10.5).color(c(theme::TEXT3)));
+                    let mark = if r0.course { "▮" } else { "▪" };
+                    let txt = trunc_to_width(ui, &r0.text, FontId::proportional(11.0), (ui.available_width() - 90.0).max(40.0));
+                    ui.label(RichText::new(format!("{} {}", mark, txt)).size(11.5).color(r0.col).strong());
+                    if r0.course && ui.button("编辑").clicked() { edit_course_click = Some(r0.id); }
+                });
+            }
+            if let Some(id) = edit_course_click { self.open_course_form(Some(id)); }
+        }); // 关闭分栏 columns
         for (id, val) in pending_toggle {
             if let Some(item) = self.db.todos.iter_mut().find(|x| x.id == id) { item.done = val; }
             self.save_later();
@@ -1256,8 +1652,6 @@ impl App {
             self.save_later();
         }
         if let Some(p) = pending_ctx { self.ctx(CtxKind::Calendar, p); }
-        ui.add_space(2.0);
-        ui.label(RichText::new("右键打开编辑 · N 添加待办 · P 新建阶段计划 · Esc 收起").size(10.5).color(c(theme::TEXT3)));
     }
 
     fn ctx(&mut self, kind: CtxKind, pos: Pos2) {
@@ -1272,15 +1666,17 @@ impl App {
                 self.show_ctx = false; self.add_open = false; self.plan_open = false;
                 self.edit_todo = None; self.sel_todo = None; self.edit_rect = None;
                 self.edit_plan_id = None; self.jump_open = false; self.io_open = false;
+                self.course_open = false; self.course_edit_id = None; self.slot_open = false;
             }
             // 编辑/新建/弹窗态：屏蔽 N/P/T 与左右翻页快捷键
             // 注意必须短路（!editing && consume_key），否则编辑框里输入 n/p/t 会被拦截去触发新建
             let editing = self.edit_todo.is_some() || self.edit_plan_id.is_some()
-                          || self.jump_open || self.io_open || self.plan_open || self.add_open;
+                          || self.jump_open || self.io_open || self.plan_open || self.add_open
+                          || self.course_open || self.slot_open;
             if !editing && i.consume_key(egui::Modifiers::NONE, egui::Key::N) { self.open_add(); }
             if !editing && i.consume_key(egui::Modifiers::NONE, egui::Key::P) { self.open_plan_form(); }
-            if !editing && i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowLeft) { self.shift_month(-1); }
-            if !editing && i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowRight) { self.shift_month(1); }
+            if !editing && i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowLeft) { self.shift_page(-1); }
+            if !editing && i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowRight) { self.shift_page(1); }
             if !editing && i.consume_key(egui::Modifiers::NONE, egui::Key::T) { self.goto_today(); }
         });
     }
