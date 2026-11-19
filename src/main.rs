@@ -6,6 +6,37 @@ use egui::{Color32, Vec2, FontId, RichText, Stroke, Rounding, Margin, Align2, Po
 use chrono::{Datelike, Duration, Local, NaiveDate, Timelike};
 use std::time::{Duration as StdDuration, Instant};
 
+// Win32：DWM 把原生标题栏染成主面板同色，视觉上像内嵌（拖拽/双击/缩放仍全原生）
+#[cfg(target_os = "windows")]
+unsafe extern "system" {
+    fn DwmSetWindowAttribute(hwnd: isize, attr: u32, pv: *const core::ffi::c_void, cb: u32) -> i32;
+}
+#[cfg(target_os = "windows")]
+const DWMWA_USE_IMMERSIVE_DARK_MODE: u32 = 20;
+#[cfg(target_os = "windows")]
+const DWMWA_CAPTION_COLOR: u32 = 35;
+
+/// 从 eframe Frame 取 Win32 HWND
+#[cfg(target_os = "windows")]
+fn frame_hwnd(frame: &eframe::Frame) -> Option<isize> {
+    use raw_window_handle::{RawWindowHandle, HasWindowHandle};
+    match frame.window_handle().ok()?.as_ref() {
+        RawWindowHandle::Win32(h) => Some(h.hwnd.get()),
+        _ => None,
+    }
+}
+/// 原生标题栏染成主面板底色（一次性）
+#[cfg(target_os = "windows")]
+fn tint_titlebar(hwnd: isize, bg: Color32) {
+    unsafe {
+        let dark: i32 = 1;
+        DwmSetWindowAttribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, &dark as *const _ as *const _, 4);
+        // DWM 要 COLORREF: 0x00BBGGRR
+        let cref: u32 = ((bg.b() as u32) << 16) | ((bg.g() as u32) << 8) | (bg.r() as u32);
+        DwmSetWindowAttribute(hwnd, DWMWA_CAPTION_COLOR, &cref as *const _ as *const _, 4);
+    }
+}
+
 mod data;
 mod lunar;
 use data::{Db, Todo, Plan, dkey, parse_key, prio_color, PLAN_COLORS};
@@ -62,6 +93,8 @@ const WEEK: [&str;7] = ["日","一","二","三","四","五","六"];
 const WEEK_FULL: [&str;7] = ["星期日","星期一","星期二","星期三","星期四","星期五","星期六"];
 
 struct App {
+    // 原生标题栏 DWM 染色（一次性）
+    dwm_applied: bool,
     db: Db,
     today: NaiveDate,
     view: NaiveDate,
@@ -71,6 +104,8 @@ struct App {
     add_prio: u8,
     add_text: String,
     add_open: bool,
+    // 打开表单后自动聚焦输入框（首帧 request_focus 一次）
+    focus_add: bool,
     // 待办选中/双击编辑
     sel_todo: Option<u64>,
     edit_todo: Option<u64>,
@@ -81,6 +116,19 @@ struct App {
     plan_end: String,
     plan_color: usize,
     plan_open: bool,
+    // 阶段计划编辑
+    edit_plan_id: Option<u64>,
+    focus_plan: bool,
+    // 日期跳转
+    jump_open: bool,
+    focus_jump: bool,
+    jump_text: String,
+    // 导入导出
+    io_open: bool,
+    io_scope: IoScope,
+    io_format: IoFormat,
+    io_date: String,
+    io_msg: String,
 
     // 右键菜单
     show_ctx: bool,
@@ -90,6 +138,11 @@ struct App {
     // 持久化
     pending_save: bool,
     last_save: Instant,
+    // 窗口几何记忆：每帧记录当前窗口状态，save 时写盘，new 时读取并应用
+    win_pos: Pos2,
+    win_size: Vec2,
+    win_max: bool,
+    win_applied: bool,
 
     // ── 动画状态（丝滑的核心）──
     /// 月份切换淡入进度 0→1
@@ -105,12 +158,39 @@ struct App {
 #[derive(Clone, Copy, PartialEq)]
 enum CtxKind { None, PlanZone, Calendar }
 
+/// 导入/导出范围
+#[derive(Clone, Copy, PartialEq)]
+enum IoScope { Day, Week, Month, Year }
+impl IoScope {
+    fn label(self) -> &'static str {
+        match self { IoScope::Day => "当日", IoScope::Week => "本周", IoScope::Month => "本月", IoScope::Year => "本年" }
+    }
+}
+
+/// 导出格式
+#[derive(Clone, Copy, PartialEq)]
+enum IoFormat { Json, Markdown }
+
 impl App {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
         setup_fonts(&cc.egui_ctx);
         setup_style(&cc.egui_ctx);
         let today = Local::now().date_naive();
+        // 读取上次窗口几何（x,y,w,h,max），默认给一组合理值
+        let (mut wp, mut ws, mut wm) = (Pos2::new(80.0, 60.0), Vec2::new(1420.0, 900.0), false);
+        if let Some(st) = cc.storage {
+            if let Some(raw) = st.get_string("win_geom") {
+                let p: Vec<&str> = raw.split(',').collect();
+                if p.len() == 5 {
+                    if let (Ok(x), Ok(y), Ok(w), Ok(h)) = (
+                        p[0].parse::<f32>(), p[1].parse::<f32>(), p[2].parse::<f32>(), p[3].parse::<f32>()) {
+                        wp = Pos2::new(x, y); ws = Vec2::new(w, h); wm = p[4] == "1";
+                    }
+                }
+            }
+        }
         Self {
+            dwm_applied: false,
             db: data::load(),
             view: NaiveDate::from_ymd_opt(today.year(), today.month(), 1).unwrap(),
             selected: today,
@@ -118,6 +198,7 @@ impl App {
             add_prio: 2,
             add_text: String::new(),
             add_open: false,
+            focus_add: false,
             sel_todo: None,
             edit_todo: None,
             edit_text: String::new(),
@@ -127,11 +208,25 @@ impl App {
             plan_end: String::new(),
             plan_color: 0,
             plan_open: false,
+            edit_plan_id: None,
+            focus_plan: false,
+            jump_open: false,
+            focus_jump: false,
+            jump_text: String::new(),
+            io_open: false,
+            io_scope: IoScope::Day,
+            io_format: IoFormat::Markdown,
+            io_date: dkey(&today),
+            io_msg: String::new(),
             show_ctx: false,
             ctx_pos: egui::pos2(0.0, 0.0),
             ctx_kind: CtxKind::None,
             pending_save: false,
             last_save: Instant::now(),
+            win_pos: wp,
+            win_size: ws,
+            win_max: wm,
+            win_applied: false,
             month_anim: 1.0,
             select_pulse: 1.0,
             form_anim: 1.0,
@@ -173,14 +268,34 @@ impl App {
 
     fn open_plan_form(&mut self) {
         self.plan_open = true;
+        self.focus_plan = true;
+        self.edit_plan_id = None;
+        self.plan_name.clear();
         self.form_anim = 0.0;
         self.plan_start = dkey(&self.selected);
         self.plan_end = dkey(&(self.selected + Duration::days(3)));
         self.plan_color = self.db.plans.len() % PLAN_COLORS.len();
     }
+    /// 编辑已有阶段计划：加载数据进表单
+    fn edit_plan(&mut self, id: u64) {
+        if let Some(pl) = self.db.plans.iter().find(|x| x.id == id).cloned() {
+            self.plan_open = true;
+            self.focus_plan = true;
+            self.form_anim = 0.0;
+            self.edit_plan_id = Some(id);
+            self.plan_name = pl.name.clone();
+            self.plan_start = pl.start.clone();
+            self.plan_end = pl.end.clone();
+            // 反查颜色索引
+            self.plan_color = PLAN_COLORS.iter().position(|x| {
+                (x[0]-pl.color[0]).abs() < 0.01 && (x[1]-pl.color[1]).abs() < 0.01 && (x[2]-pl.color[2]).abs() < 0.01
+            }).unwrap_or(0);
+        }
+    }
     fn open_add(&mut self) {
         if !self.add_open { self.form_anim = 0.0; }
         self.add_open = true;
+        self.focus_add = true;
     }
 
     fn save_plan(&mut self) {
@@ -189,10 +304,19 @@ impl App {
         let mut e = self.plan_end.clone();
         if s.is_empty() || e.is_empty() { s = dkey(&self.selected); e = s.clone(); }
         if e < s { std::mem::swap(&mut s, &mut e); }
-        self.db.plans.push(Plan {
-            id: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64,
-            name, color: PLAN_COLORS[self.plan_color % PLAN_COLORS.len()], start: s, end: e,
-        });
+        let color = PLAN_COLORS[self.plan_color % PLAN_COLORS.len()];
+        if let Some(id) = self.edit_plan_id.take() {
+            // 更新已有计划
+            if let Some(pl) = self.db.plans.iter_mut().find(|x| x.id == id) {
+                pl.name = name; pl.color = color; pl.start = s; pl.end = e;
+            }
+        } else {
+            // 新建计划
+            self.db.plans.push(Plan {
+                id: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64,
+                name, color, start: s, end: e,
+            });
+        }
         self.plan_name.clear();
         self.plan_open = false;
         self.save_later();
@@ -234,10 +358,17 @@ fn setup_fonts(ctx: &egui::Context) {
             break;
         }
     }
+    // Segoe UI Symbol：唯一正确渲染竖三点 ⋮ (U+22EE) 的系统字体
+    if let Ok(bytes) = std::fs::read("C:/Windows/Fonts/seguisym.ttf") {
+        fonts.font_data.insert("sym".into(), egui::FontData::from_owned(bytes).into());
+        fonts.families.entry(egui::FontFamily::Name("sym".into())).or_default().push("sym".into());
+    }
     ctx.set_fonts(fonts);
 }
 
 fn setup_style(ctx: &egui::Context) {
+    // 强制深色：否则 egui 跟随 Windows 系统主题（白天=浅色），按钮白底 + 白字 → 看不见
+    ctx.set_theme(egui::ThemePreference::Dark);
     let mut style = (*ctx.style()).clone();
     // 排版层级：display / title / body / label（严格 4 级）
     style.text_styles.insert(egui::TextStyle::Small,     FontId::new(11.0, egui::FontFamily::Proportional));
@@ -247,6 +378,10 @@ fn setup_style(ctx: &egui::Context) {
     style.text_styles.insert(egui::TextStyle::Monospace, FontId::new(11.0, egui::FontFamily::Monospace));
     style.spacing.item_spacing = Vec2::new(6.0, 4.0);
     style.spacing.button_padding = Vec2::new(9.0, 4.0);
+    // 滚动条缩细、贴左栏右缘，不碍事
+    style.spacing.scroll.bar_width = 4.0;
+    style.spacing.scroll.bar_outer_margin = -9.0;
+    style.spacing.scroll.bar_inner_margin = 1.0;
     let mut v = style.visuals.clone();
     v.dark_mode = true;
     v.window_fill = c(theme::PANEL);
@@ -269,7 +404,39 @@ fn setup_style(ctx: &egui::Context) {
 }
 
 impl eframe::App for App {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        // 每帧锁定深色主题：persistence 会记住 System，白天系统浅色会把按钮变白底白字
+        if ctx.theme() != egui::Theme::Dark { ctx.set_theme(egui::ThemePreference::Dark); }
+        // ── 原生标题栏染成主面板底色（一次性，视觉上像内嵌）──
+        #[cfg(target_os = "windows")]
+        if !self.dwm_applied {
+            if let Some(h) = frame_hwnd(frame) {
+                tint_titlebar(h, c(theme::BG));
+                self.dwm_applied = true;
+            }
+        }
+
+        // ── 窗口几何记忆：首帧应用上次的尺寸/位置/最大化状态 ──
+        if !self.win_applied {
+            if self.win_max {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(true));
+            } else {
+                ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(self.win_pos));
+                ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(self.win_size));
+            }
+            self.win_applied = true;
+        }
+        // 每帧记录当前窗口几何（save 时写盘；最大化时不记位置/尺寸，避免下次恢复成最大化前的怪尺寸）
+        let vp = ctx.input(|i| i.viewport().clone());
+        if let (Some(or), Some(ir)) = (vp.outer_rect, vp.inner_rect) {
+            let is_max = vp.maximized.unwrap_or(false);
+            self.win_max = is_max;
+            if !is_max {
+                self.win_pos = or.min;
+                self.win_size = ir.size();
+            }
+        }
+
         // 单一时间源：每帧只取一次，跨天自动更新
         let now = Local::now();
         let today = now.date_naive();
@@ -290,34 +457,53 @@ impl eframe::App for App {
             .show(ctx, |ui| {
                 let area = ui.available_rect_before_wrap();
                 // 显式对称间距：左边距 = 中缝 = 右边距（由 CentralPanel margin 提供）
-                let gap = 16.0f32;
-                let left_w = 292.0f32.min(area.width() * 0.32).max(220.0);
-                let left_rect = egui::Rect::from_min_size(area.min, egui::vec2(left_w, area.height()));
-                // 右栏基准左边界（含之前的 +20 右移）
-                let base_left = area.min.x + left_w + gap + 20.0;
-                let base_full_w = area.max.x - base_left;
-                // 右栏整体右移 50px（左右边界一起平移，宽度不变；右边界 clamp 防超出窗口被裁）
-                let shift = 50.0f32;
-                let right_left = base_left + shift;
-                let right_r = (area.max.x - base_full_w / 14.0 + shift).min(area.max.x);
+                // 左右栏布局：左栏定宽 → 中间留舒服间隙 → 右栏占据剩余并适度收窄
+                // 布局：左 margin(16) + 左栏(left_w) + 中缝(gap) + 右栏(剩余) + 右 margin(16)，全部固定。
+                // egui 的 Frame 背景 = content_ui.min_rect()（内容宽度），长文字换行后 min_rect
+                // 不超出 left_rect，背景停在左栏内，gap 露出 BG，两栏自然分开。
+                let gap = 28.0f32;
+                // 左栏加宽到 312，把「阶段计划」行的＋新建按钮完整包进面板内；
+                // right_left 由 left_w 算出，中缝与右栏左缘随之同步右移，右栏相应变窄。
+                let left_w = 352.0f32.min(area.width() * 0.40).max(220.0);
+                // 左栏起点回到 area.min.x（比上次右移 20px），宽度减 20 → 左栏右缘不变、栏体变窄
+                let left_origin = Pos2::new(area.min.x, area.min.y);
+                let left_rect = egui::Rect::from_min_size(left_origin, egui::vec2(left_w, area.height()));
+                // 右栏左边界 = 左栏右缘 + 间隙；右边界贴到 area.max.x（CentralPanel 16px 边距即右边距）
+                let right_left = area.min.x + left_w + gap;
+                let right_r = area.max.x;
                 let right_rect = egui::Rect::from_min_max(
                     Pos2::new(right_left, area.min.y),
                     Pos2::new(right_r, area.max.y),
                 );
                 // 左栏：绝对矩形 + 独立滚动
                 ui.allocate_ui_at_rect(left_rect, |u| {
-                    egui::Frame::none().fill(c(theme::PANEL)).rounding(Rounding::same(radius::LG))
-                        .stroke(Stroke::new(1.0, c(theme::STROKE)))
+                    // 背景手动画在固定 left_rect：egui 的 Frame 背景 = content_ui.min_rect()，
+                    // 内容一溢出背景就铺出左栏、吃掉中缝；rect_filled 画固定矩形则永不串色。
+                    u.painter().rect_filled(left_rect, Rounding::same(radius::LG), c(theme::PANEL));
+                    u.painter().rect_stroke(left_rect, Rounding::same(radius::LG),
+                        Stroke::new(1.0, c(theme::STROKE)));
+                    egui::Frame::none()
                         .inner_margin(Margin::symmetric(18.0, 16.0)).show(u, |ui| {
-                            egui::ScrollArea::vertical().id_source("left_sidebar_scroll")
+                            // 顶部（日期/时钟/统计）固定不滚动
+                            self.left_header(ui, &now);
+                            // 只有阶段计划 + 未来七天这一块独立滚动，滚动条贴左栏面板右缘
+                            let lists_top = ui.cursor().top();
+                            let sb_rect = egui::Rect::from_min_max(
+                                Pos2::new(left_rect.right() - 20.0, lists_top + 4.0),
+                                Pos2::new(left_rect.right() - 10.0, left_rect.bottom() - 6.0),
+                            );
+                            egui::ScrollArea::vertical().id_source("left_lists_scroll")
                                 .auto_shrink([false, false])
-                                .show(ui, |ui| { ui.vertical(|ui| self.left_panel(ui, &now)); });
+                                .scroll_bar_rect(sb_rect)
+                                .show(ui, |ui| { self.left_lists(ui); });
                         });
                 });
                 // 右栏：绝对矩形，内部三段式固定分区
                 ui.allocate_ui_at_rect(right_rect, |u| {
-                    egui::Frame::none().fill(c(theme::PANEL)).rounding(Rounding::same(radius::LG))
-                        .stroke(Stroke::new(1.0, c(theme::STROKE)))
+                    u.painter().rect_filled(right_rect, Rounding::same(radius::LG), c(theme::PANEL));
+                    u.painter().rect_stroke(right_rect, Rounding::same(radius::LG),
+                        Stroke::new(1.0, c(theme::STROKE)));
+                    egui::Frame::none()
                         .inner_margin(Margin::symmetric(18.0, 16.0)).show(u, |ui| {
                             self.right_panel(ui);
                         });
@@ -365,11 +551,20 @@ impl eframe::App for App {
             ctx.request_repaint_after(StdDuration::from_millis(ms_until_sec));
         }
     }
+
+    fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        let raw = format!("{},{},{},{},{}",
+            self.win_pos.x, self.win_pos.y, self.win_size.x, self.win_size.y,
+            if self.win_max { 1 } else { 0 });
+        storage.set_string("win_geom", raw);
+    }
+
 }
 
 impl App {
+    // ═══════════ 自绘标题栏 ═══════════
     // ═══════════ 左栏 ═══════════
-    fn left_panel(&mut self, ui: &mut egui::Ui, now: &chrono::DateTime<Local>) {
+    fn left_header(&mut self, ui: &mut egui::Ui, now: &chrono::DateTime<Local>) {
         // ── 大日期（视觉焦点）──
         ui.horizontal(|ui| {
             ui.label(RichText::new(self.today.day().to_string())
@@ -426,12 +621,17 @@ impl App {
         ui.add(egui::ProgressBar::new(rate).desired_height(5.0).fill(c(theme::MINT)));
         ui.label(RichText::new(format!("完成率 {:.0}%", rate * 100.0)).size(11.0).color(c(theme::TEXT3)));
         section_rule(ui);
+    }
 
+    // ═══════════ 左栏下半：阶段计划 + 未来七天（独立滚动区）═══════════
+    fn left_lists(&mut self, ui: &mut egui::Ui) {
         // ── 阶段计划 ──
         ui.horizontal(|ui| {
             section_title(ui, "阶段计划");
-            ui.add_space(ui.available_width());
-            if ui.small_button("＋ 新建").clicked() { self.open_plan_form(); }
+            // 按钮贴内容区右缘：right_to_left 不会溢出左栏（add_space(available_width) 会顶出界）
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.small_button("＋ 新建").clicked() { self.open_plan_form(); }
+            });
         });
         let zone = ui.allocate_response(Vec2::new(ui.available_width(), 4.0), egui::Sense::click());
         if zone.secondary_clicked() { self.ctx(CtxKind::PlanZone, ui_pos(ui)); }
@@ -439,52 +639,115 @@ impl App {
             let rg = format!("{}→{}·{}天", short(&p.start), short(&p.end),
                              (parse_key(&p.end) - parse_key(&p.start)).num_days() + 1);
             // 整行 hover 高亮：在 horizontal 内用 rect_contains_pointer（坐标一致）
+            // hover 高亮矩形：在 horizontal 外用 cursor 位置构造整行矩形，
+            // 不用 ui.max_rect()（嵌套 right_to_left 后它只剩按钮区宽，高亮会错位到最右）
+            let row_left = ui.cursor().left();
+            let row_top = ui.cursor().top();
+            let row_w = ui.available_width();
+            let row_hl = egui::Rect::from_min_size(Pos2::new(row_left, row_top), Vec2::new(row_w, 20.0));
+            let row_hover = ui.rect_contains_pointer(row_hl);
             ui.horizontal(|ui| {
-                let row_rect = ui.max_rect();
-                if ui.rect_contains_pointer(row_rect) {
-                    ui.painter().rect_filled(row_rect, Rounding::same(radius::SM), ca(theme::ACCENT, 42));
-                }
+                // 色块 + 名称：左对齐，名称占据剩余宽度
                 ui.add(egui::Label::new(RichText::new("■").color(rgb(p.color)).size(11.0)));
-                if ui.add(egui::Label::new(RichText::new(&p.name).size(12.0).color(c(theme::TEXT2)))).clicked() {
+                // 给日期(≈120px)+⋯按钮(≈30px)留足宽度，防止日期溢出被按钮挤压
+                let name_w = ui.available_width() - 166.0;
+                // hover 时名称文字提亮+加粗（不用背景色块）；无背景高亮，避免切割日期/被按钮遮
+                let name_style = if row_hover {
+                    RichText::new(&p.name).size(12.5).color(c(theme::ACCENT2)).strong()
+                } else {
+                    RichText::new(&p.name).size(12.0).color(c(theme::TEXT2))
+                };
+                let name_resp = ui.allocate_ui_with_layout(
+                    Vec2::new(name_w.max(40.0), 20.0), egui::Layout::left_to_right(egui::Align::Center),
+                    // truncate 自带完整文本 tooltip，不再手动 on_hover_text（否则悬停出现两行重复全名）
+                    |ui| ui.add(egui::Label::new(name_style).truncate()),
+                ).inner;
+                if name_resp.clicked() {
                     let d = parse_key(&p.start);
                     self.select(d);
                     self.view = NaiveDate::from_ymd_opt(d.year(), d.month(), 1).unwrap();
                 }
-                ui.label(RichText::new(rg).size(10.0).color(c(theme::TEXT3)));
-                if ui.small_button("×").clicked() { self.db.plans.retain(|x| x.id != p.id); self.save_later(); }
+                if name_resp.secondary_clicked() { self.ctx(CtxKind::PlanZone, ui_pos(ui)); }
+                // 日期 + ⋯ 菜单：right_to_left 固定在行右缘，与名称垂直居中对齐，每行同一列
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.push_id(p.id, |ui| {
+                        egui::menu::menu_custom_button(ui,
+                            egui::Button::new(RichText::new("⋮").font(FontId::new(15.0, egui::FontFamily::Name("sym".into()))))
+                                .fill(Color32::TRANSPARENT)
+                                .stroke(Stroke::new(1.0, c(theme::STROKE_HI)))
+                                .rounding(Rounding::same(4.0))
+                                .min_size(Vec2::new(13.0, 22.0)), |ui| {
+                            if ui.button("✎  编辑").clicked() { self.edit_plan(p.id); ui.close_menu(); }
+                            if ui.button("×  删除").clicked() {
+                                self.db.plans.retain(|x| x.id != p.id);
+                                if self.edit_plan_id == Some(p.id) { self.edit_plan_id = None; self.plan_open = false; }
+                                self.save_later();
+                                ui.close_menu();
+                            }
+                        });
+                    });
+                    ui.label(RichText::new(rg).size(10.0).color(c(theme::TEXT3)));
+                });
             });
         }
         // 表单展开：淡入背景（form_anim 驱动）
         if self.plan_open { self.plan_form(ui); }
         section_rule(ui);
 
-        // ── 未来七天 ──
+        // ── 未来七天（每日计划 + 当天阶段计划 合并显示）──
         section_title(ui, "未来七天");
-        let mut items: Vec<(NaiveDate, String, u8)> = Vec::new();
+        let mut any = false;
         for i in 0..7 {
             let d = self.today + Duration::days(i);
-            for t in self.db.todos_of(&dkey(&d)) { if !t.done { items.push((d, t.text.clone(), t.prio)); } }
+            let dk = dkey(&d);
+            let todos: Vec<(String, u8)> = self.db.todos_of(&dk).into_iter()
+                .filter(|t| !t.done).map(|t| (t.text.clone(), t.prio)).collect();
+            let plans: Vec<(String, [f32;3])> = self.db.plans_on(&dk).into_iter()
+                .map(|p| (p.name.clone(), p.color)).collect();
+            if todos.is_empty() && plans.is_empty() { continue; }
+            any = true;
+            let day_label = if d == self.today { "今天".to_string() } else { d.format("%m/%d").to_string() };
+            // 每天的日期标题
+            ui.add(egui::Label::new(RichText::new(&day_label).size(11.0).strong().color(c(theme::ACCENT2))));
+            // 当天的每日计划（缩进）
+            for (text, prio) in todos {
+                ui.horizontal(|ui| {
+                    let row_rect = ui.max_rect();
+                    ui.add_space(10.0);
+                    let r = ui.allocate_response(Vec2::new(3.0, 14.0), egui::Sense::hover()).rect;
+                    ui.painter().rect_filled(r, Rounding::same(1.5), rgb(prio_color(prio)));
+                    // Frame 包住整段 wrap 文字：背景跟随内容 min_rect（含所有换行行），
+                    // hover 时一个计划一个圆角框圈住全部文字，不再只亮第一行。
+                    let hovered = ui.rect_contains_pointer(row_rect);
+                    let base = rgb(prio_color(prio));
+                    let fill = if hovered {
+                        Color32::from_rgba_unmultiplied(base.r(), base.g(), base.b(), 40)
+                    } else { Color32::TRANSPARENT };
+                    let text_w = (row_rect.width() - 40.0).max(40.0);
+                    egui::Frame::none().fill(fill).rounding(Rounding::same(radius::SM))
+                        .inner_margin(Margin::symmetric(5.0, 2.0)).show(ui, |ui| {
+                            ui.set_width(text_w - 10.0);
+                            let resp = ui.add(egui::Label::new(
+                                RichText::new(&text).size(12.0).color(c(theme::TEXT2))).wrap().sense(egui::Sense::click()));
+                            if resp.clicked() { self.select(d); }
+                            if resp.secondary_clicked() { self.select(d); self.ctx(CtxKind::Calendar, ui_pos(ui)); }
+                        });
+                });
+            }
+            // 当天关联的阶段计划（缩进，紧随每日计划之后）
+            for (pl_name, pl_color) in plans {
+                let prow = ui.max_rect();
+                let pw = (prow.width() - 24.0).max(40.0);
+                let resp = ui.allocate_ui_with_layout(
+                    Vec2::new(pw, 14.0), egui::Layout::top_down(egui::Align::LEFT),
+                    |ui| ui.add(egui::Label::new(RichText::new(format!("■ {}", pl_name)).size(10.5).color(rgb(pl_color))).wrap()),
+                ).inner;
+                if resp.clicked() { self.select(d); }
+                if resp.secondary_clicked() { self.select(d); self.ctx(CtxKind::Calendar, ui_pos(ui)); }
+            }
         }
-        if items.is_empty() {
-            ui.label(RichText::new("未来七天暂无未完成安排").size(12.0).color(c(theme::TEXT3)));
-        }
-        for (d, text, prio) in items.into_iter() {
-            ui.horizontal(|ui| {
-                // 整行 hover 高亮（坐标一致）
-                let row_rect = ui.max_rect();
-                if ui.rect_contains_pointer(row_rect) {
-                    ui.painter().rect_filled(row_rect, Rounding::same(radius::SM), ca(theme::ACCENT, 42));
-                }
-                let day_label = if d == self.today { "今天".to_string() } else { d.format("%m/%d").to_string() };
-                // 用粗体亮色强调日期，去掉橙色背景块（避免与行 hover 高亮撞色）
-                ui.add(egui::Label::new(RichText::new(format!("{}  ", day_label)).size(11.0)
-                    .strong().color(c(theme::ACCENT2))));
-                let r = ui.allocate_response(Vec2::new(3.0, 14.0), egui::Sense::hover()).rect;
-                ui.painter().rect_filled(r, Rounding::same(1.5), rgb(prio_color(prio)));
-                if ui.add(egui::Label::new(RichText::new(&text).size(12.0).color(c(theme::TEXT2)))).clicked() {
-                    self.select(d);
-                }
-            });
+        if !any {
+            ui.label(RichText::new("未来七天暂无安排").size(12.0).color(c(theme::TEXT3)));
         }
     }
 
@@ -493,8 +756,10 @@ impl App {
         let bg = mix(c(theme::CARD), c(theme::ACCENT), (1.0 - t) * 0.28);
         egui::Frame::none().fill(bg).rounding(Rounding::same(radius::SM))
             .inner_margin(Margin::same(10.0)).show(ui, |ui| {
-                ui.add(egui::TextEdit::singleline(&mut self.plan_name)
+                let name_resp = ui.add(egui::TextEdit::singleline(&mut self.plan_name)
                     .hint_text("计划名称，如「项目冲刺」").desired_width(ui.available_width()));
+                if self.focus_plan { name_resp.request_focus(); self.focus_plan = false; }
+                if name_resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) { self.save_plan(); }
                 ui.horizontal(|ui| {
                     ui.add(egui::TextEdit::singleline(&mut self.plan_start).hint_text("起始 YYYY-MM-DD").desired_width(104.0));
                     ui.label(RichText::new("→").color(c(theme::TEXT3)));
@@ -507,7 +772,8 @@ impl App {
                         if ui.add(egui::Button::new(label).frame(false)).clicked() { self.plan_color = i; }
                     }
                 });
-                if ui.button("创建计划").clicked() { self.save_plan(); }
+                let save_label = if self.edit_plan_id.is_some() { "保存修改" } else { "创建计划" };
+                if ui.button(save_label).clicked() { self.save_plan(); }
             });
     }
 
@@ -524,11 +790,94 @@ impl App {
             // 翻页按钮贴内容区右缘 = 日历周六列右缘（right_to_left 保证不被裁）
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui.add_sized([28.0, 26.0], egui::Button::new("›")).clicked() { self.shift_month(1); }
-                if ui.add_sized([58.0, 26.0], egui::Button::new("今天")).clicked() { self.goto_today(); }
+                if self.jump_open {
+                    let resp = ui.add_sized([126.0, 26.0], egui::TextEdit::singleline(&mut self.jump_text)
+                        .id_source("jump_inline_edit").hint_text("YYYY-MM-DD 回车"));
+                    if self.focus_jump { resp.request_focus(); self.focus_jump = false; }
+                    let enter = resp.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    if enter || resp.lost_focus() {
+                        if let Ok(d) = NaiveDate::parse_from_str(self.jump_text.trim(), "%Y-%m-%d") {
+                            self.selected = d;
+                            self.view = NaiveDate::from_ymd_opt(d.year(), d.month(), 1).unwrap();
+                            self.month_anim = 0.0; self.select_pulse = 0.0;
+                        }
+                        self.jump_open = false;
+                    }
+                } else if ui.add_sized([52.0, 26.0], egui::Button::new("跳转")).on_hover_text("输入日期跳转").clicked() {
+                    self.jump_open = true; self.jump_text = String::new(); self.focus_jump = true;
+                }
                 if ui.add_sized([28.0, 26.0], egui::Button::new("‹")).clicked() { self.shift_month(-1); }
+                if ui.add_sized([52.0, 26.0], egui::Button::new("导入/导出")).on_hover_text("导入导出日/周/月/年计划").clicked() {
+                    self.io_open = !self.io_open;
+                }
             });
         });
         // ◀ 单独绑定（上面占位，这里补事件不便，统一在下方处理）
+        // ── 导入导出面板 ──
+        if self.io_open {
+            egui::Frame::none().fill(c(theme::CARD)).rounding(Rounding::same(radius::SM))
+                .inner_margin(Margin::symmetric(8.0, 5.0)).show(ui, |ui| {
+                    // 第一行：范围 + 日期
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("范围:").size(11.0).color(c(theme::TEXT2)));
+                        for sc in [IoScope::Day, IoScope::Week, IoScope::Month, IoScope::Year] {
+                            let on = self.io_scope == sc;
+                            if ui.add(egui::Button::new(RichText::new(sc.label()).size(11.0))
+                                .frame(on)).clicked() { self.io_scope = sc; }
+                        }
+                        ui.label(RichText::new("日期:").size(11.0).color(c(theme::TEXT2)));
+                        ui.add(egui::TextEdit::singleline(&mut self.io_date)
+                            .id_source("io_date_edit").desired_width(104.0).hint_text("YYYY-MM-DD"));
+                        ui.label(RichText::new("格式:").size(11.0).color(c(theme::TEXT2)));
+                        if ui.add(egui::Button::new("JSON").frame(self.io_format == IoFormat::Json)).clicked() { self.io_format = IoFormat::Json; }
+                        if ui.add(egui::Button::new("Markdown").frame(self.io_format == IoFormat::Markdown)).clicked() { self.io_format = IoFormat::Markdown; }
+                    });
+                    // 第二行：导出 / 导入 / 关闭（点击弹原生文件管理器选位置）
+                    ui.horizontal(|ui| {
+                        if ui.button("导出…").clicked() {
+                            let scope = match self.io_scope { IoScope::Day=>"day", IoScope::Week=>"week", IoScope::Month=>"month", IoScope::Year=>"year" };
+                            let center = NaiveDate::parse_from_str(self.io_date.trim(), "%Y-%m-%d")
+                                .unwrap_or(self.selected);
+                            let (content, ext, filter) = match self.io_format {
+                                IoFormat::Json => (data::export_json(&self.db, scope, center), "json", "JSON"),
+                                IoFormat::Markdown => (data::export_markdown(&self.db, scope, center), "md", "Markdown"),
+                            };
+                            let def_name = format!("planum_{}_{}.{}", scope, dkey(&center), ext);
+                            if let Some(path) = rfd::FileDialog::new()
+                                .set_title("选择导出位置").set_file_name(&def_name)
+                                .add_filter(filter, &[ext]).save_file()
+                            {
+                                match std::fs::write(&path, content) {
+                                    Ok(_) => self.io_msg = format!("已导出: {}", path.file_name().unwrap_or_default().to_string_lossy()),
+                                    Err(e) => self.io_msg = format!("导出失败: {}", e),
+                                }
+                            } else {
+                                self.io_msg = "已取消导出".into();
+                            }
+                        }
+                        if ui.button("导入…").clicked() {
+                            if let Some(path) = rfd::FileDialog::new()
+                                .set_title("选择要导入的 JSON 文件")
+                                .add_filter("JSON", &["json"]).pick_file()
+                            {
+                                match std::fs::read_to_string(&path) {
+                                    Ok(txt) => match data::import_json(&mut self.db, &txt) {
+                                        Ok((nt, np)) => { self.io_msg = format!("导入完成: {}待办 {}计划", nt, np); self.save_later(); }
+                                        Err(e) => self.io_msg = format!("解析失败: {}", e),
+                                    },
+                                    Err(e) => self.io_msg = format!("读取失败: {}", e),
+                                }
+                            } else {
+                                self.io_msg = "已取消导入".into();
+                            }
+                        }
+                        if ui.button("×").clicked() { self.io_open = false; }
+                    });
+                    if !self.io_msg.is_empty() {
+                        ui.label(RichText::new(&self.io_msg).size(10.5).color(c(theme::MINT)));
+                    }
+                });
+        }
         // 图例
         ui.horizontal_wrapped(|ui| {
             legend(ui, rgb(prio_color(1)), "高"); legend(ui, rgb(prio_color(2)), "中");
@@ -639,8 +988,14 @@ impl App {
                     let x = rect.left() + 6.0;
                     let ty = rect.top() + 4.0;
                     let day_col = if is_today { c(ACCENT_INK) } else if out { ca(theme::TEXT, 110) } else { c(theme::TEXT) };
-                    if is_today { ui.painter().circle_filled(Pos2::new(x + 10.0, ty + 10.0), 10.0, c(theme::ACCENT)); }
-                    ui.painter().text(Pos2::new(x, ty), Align2::LEFT_TOP, d.day().to_string(),
+                    if is_today {
+                        // 当日高亮：占满左上角的圆角方块（数字画在其上）
+                        let hb = egui::Rect::from_min_size(
+                            Pos2::new(rect.left() + 4.0, rect.top() + 2.0), Vec2::new(25.0, 23.0));
+                        ui.painter().rect_filled(hb, Rounding::same(radius::SM), c(theme::ACCENT));
+                    }
+                    let day_pos = if is_today { Pos2::new(x + 3.0, ty + 1.0) } else { Pos2::new(x, ty) };
+                    ui.painter().text(day_pos, Align2::LEFT_TOP, d.day().to_string(),
                         FontId::proportional(13.0), day_col);
                     let mini = fest.clone().unwrap_or_else(|| if l.day == 1 { lunar_short(&l) } else { String::new() });
                     if !mini.is_empty() {
@@ -670,8 +1025,11 @@ impl App {
                                 Pos2::new(rect.left() + 5.0, ypos), Vec2::new(rect.width() - 10.0, 15.0));
                             ui.painter().rect_filled(tr, Rounding::same(4.0),
                                 ca(theme::BG, if out { 90 } else { 175 }));
+                            let font = FontId::proportional(11.0);
+                            // 按任务条实际宽度截断，窗口缩小时也不溢出格子边界
+                            let label = trunc_to_width(ui, &t.text, font.clone(), tr.width() - 8.0);
                             ui.painter().text(Pos2::new(rect.left() + 10.0, ypos + 2.0), Align2::LEFT_TOP,
-                                trunc(&t.text, 9), FontId::proportional(11.0), col);
+                                label, font, col);
                             ui.painter().rect_filled(
                                 egui::Rect::from_min_size(Pos2::new(rect.left() + 5.0, ypos), Vec2::new(2.5, 15.0)),
                                 Rounding::same(1.0),
@@ -740,6 +1098,17 @@ impl App {
             });
         });
 
+        // 当日关联的阶段计划（紧凑色块 + 名称）
+        let day_plans = self.db.plans_on(&dkey(&self.selected));
+        if !day_plans.is_empty() {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(RichText::new("阶段计划:").size(10.5).color(c(theme::TEXT3)));
+                for pl in day_plans {
+                    ui.label(RichText::new(format!("■ {}", pl.name)).size(10.5).color(rgb(pl.color)));
+                }
+            });
+        }
+
         // 添加栏（淡入）
         if self.add_open {
             let t = Self::ease(self.form_anim);
@@ -752,8 +1121,14 @@ impl App {
                                 ["", "高", "中", "低"][p as usize])).color(rgb(prio_color(p))).size(11.0);
                             if ui.add(egui::Button::new(label).frame(false)).clicked() { self.add_prio = p; }
                         }
-                        ui.add(egui::TextEdit::singleline(&mut self.add_text)
+                        let resp = ui.add(egui::TextEdit::singleline(&mut self.add_text)
                             .hint_text("写下计划事项，回车添加…").desired_width((ui.available_width() - 56.0).max(40.0)));
+                        if self.focus_add { resp.request_focus(); self.focus_add = false; }
+                        // 单行 TextEdit 收到 Enter 会先 surrender_focus，必须用 lost_focus 判定；
+                        // 内容为空时把焦点要回来，让用户能继续输入
+                        if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                            if self.add_text.trim().is_empty() { resp.request_focus(); } else { self.add_todo(); }
+                        }
                         if ui.button("添加").clicked() { self.add_todo(); }
                     });
                 });
@@ -764,6 +1139,9 @@ impl App {
         let mut pending_toggle: Vec<(u64, bool)> = Vec::new();
         let mut pending_del: Vec<u64> = Vec::new();
         let mut pending_edit: Vec<(u64, String)> = Vec::new();
+        let mut pending_prio: Vec<(u64, u8)> = Vec::new();
+        let mut pending_edit_open: Vec<u64> = Vec::new();
+        let mut pending_ctx: Option<Pos2> = None;
         if todos.is_empty() {
             ui.label(RichText::new("这一天还没有计划。右键面板打开添加栏，选好优先级写入安排；连续多日的安排请用左侧「阶段计划」创建。")
                 .size(12.0).color(c(theme::TEXT3)));
@@ -774,19 +1152,14 @@ impl App {
                 let is_editing = self.edit_todo == Some(t.id);
                 ui.horizontal(|ui| {
                     let row_rect = ui.max_rect();
-                    // 高亮色跟随优先级/完成状态：高红 中橙 低蓝 已完成灰
-                    let hl_base = if t.done { c(theme::DONE) } else { rgb(prio_color(t.prio)) };
-                    if is_sel {
-                        ui.painter().rect_filled(row_rect, Rounding::same(radius::SM),
-                            Color32::from_rgba_unmultiplied(hl_base.r(), hl_base.g(), hl_base.b(), 60));
-                    } else if ui.rect_contains_pointer(row_rect) {
-                        ui.painter().rect_filled(row_rect, Rounding::same(radius::SM),
-                            Color32::from_rgba_unmultiplied(hl_base.r(), hl_base.g(), hl_base.b(), 30));
-                    }
                     if ui.checkbox(&mut done, "").clicked() { pending_toggle.push((t.id, done)); }
                     let r = ui.allocate_response(Vec2::new(3.0, 17.0), egui::Sense::hover()).rect;
                     ui.painter().rect_filled(r, Rounding::same(1.0),
                         if t.done { c(theme::DONE) } else { rgb(prio_color(t.prio)) });
+                    // 高亮色跟随优先级/完成状态：高红 中橙 低蓝 已完成灰
+                    let hl_base = if t.done { c(theme::DONE) } else { rgb(prio_color(t.prio)) };
+                    // 右侧要给 ≡菜单 + 低/中/高 留位置，再多留 12px 间隔，避免高亮框盖住优先级字
+                    let content_w = (row_rect.width() - 92.0).max(80.0);
                     if is_editing {
                         // 双击编辑：单行输入框，回车或失焦保存
                         let resp = ui.add(egui::TextEdit::singleline(&mut self.edit_text)
@@ -801,32 +1174,63 @@ impl App {
                             self.edit_rect = None;
                         }
                     } else {
+                        // 文字块用 Frame 包住：Frame 背景跟随内容 min_rect（含多行 wrap），
+                        // 一个计划的多行文字自然被一个圆角框圈住；选中加亮+字重。
+                        let hovered = ui.rect_contains_pointer(row_rect);
+                        let alpha = if is_sel { 70 } else if hovered { 34 } else { 0 };
+                        let fill_col = if alpha > 0 {
+                            Color32::from_rgba_unmultiplied(hl_base.r(), hl_base.g(), hl_base.b(), alpha)
+                        } else { Color32::TRANSPARENT };
+                        let frame = egui::Frame::none()
+                            .fill(fill_col)
+                            .rounding(Rounding::same(radius::SM))
+                            .inner_margin(Margin::symmetric(6.0, 3.0));
                         let style = if t.done {
                             RichText::new(&t.text).size(13.0).color(c(theme::TEXT3)).strikethrough()
+                        } else if is_sel {
+                            // 选中：提亮到近白 + 加粗字重
+                            RichText::new(&t.text).size(13.5).color(c(theme::TEXT)).strong()
                         } else {
                             RichText::new(&t.text).size(13.0).color(c(theme::TEXT2))
                         };
-                        // 双击编辑：allocate_ui_with_layout 撑满内容宽度，左对齐 + 双击命中
-                        // （不用 add_sized，它内部是 centered_and_justified 会让文字居中）
-                        let content_w = (row_rect.width() - 70.0).max(60.0);
-                        let resp = ui.allocate_ui_with_layout(
-                            Vec2::new(content_w, 20.0),
-                            egui::Layout::left_to_right(egui::Align::LEFT),
-                            |ui| ui.add(egui::Label::new(style).sense(egui::Sense::click())),
-                        ).inner;
-                        if resp.clicked() { self.sel_todo = Some(t.id); }
-                        if resp.double_clicked() {
-                            self.edit_todo = Some(t.id);
-                            self.edit_text = t.text.clone();
-                            self.sel_todo = Some(t.id);
-                            self.edit_rect = None;
-                        }
+                        frame.show(ui, |ui| {
+                            ui.set_width(content_w - 12.0);
+                            let resp = ui.add(egui::Label::new(style).wrap().sense(egui::Sense::click()));
+                            if resp.clicked() { self.sel_todo = Some(t.id); }
+                            if resp.secondary_clicked() { self.sel_todo = Some(t.id); pending_ctx = Some(ui_pos(ui)); }
+                            if resp.double_clicked() {
+                                self.edit_todo = Some(t.id);
+                                self.edit_text = t.text.clone();
+                                self.sel_todo = Some(t.id);
+                                self.edit_rect = None;
+                            }
+                        });
+                        // 文字框与右侧低/中/高之间留 ~10px 间隔
+                        ui.add_space(10.0);
                     }
-                    // 优先级 + 删除键固定在行右缘（right_to_left 保证每行同一垂直列对齐）
+                    // 菜单按钮 + 优先级文字固定在行右缘（right_to_left 保证每行同一垂直列对齐）
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.small_button("×").clicked() { pending_del.push(t.id); }
-                        ui.label(RichText::new(["", "高", "中", "低"][t.prio as usize]).size(9.5)
-                            .color(if t.done { c(theme::DONE) } else { rgb(prio_color(t.prio)) }));
+                        // ≡ 方块菜单：编辑文字 / 删除（push_id 防每行串台）
+                        ui.push_id(("todo_menu", t.id), |ui| {
+                            egui::menu::menu_custom_button(ui,
+                            egui::Button::new(RichText::new("⋮").font(FontId::new(15.0, egui::FontFamily::Name("sym".into()))))
+                                .fill(Color32::TRANSPARENT)
+                                .stroke(Stroke::new(1.0, c(theme::STROKE_HI)))
+                                .rounding(Rounding::same(4.0))
+                                .min_size(Vec2::new(13.0, 22.0)), |ui| {
+                                if ui.button("✎  编辑文字").clicked() { pending_edit_open.push(t.id); ui.close_menu(); }
+                                if ui.button("×  删除").clicked() { pending_del.push(t.id); ui.close_menu(); }
+                            });
+                        });
+                        // 优先级文字：点击循环切换 高→中→低→高
+                        let prio_label = ["", "高", "中", "低"][t.prio as usize];
+                        let pr = ui.add(egui::Button::new(RichText::new(prio_label).size(9.5)
+                            .color(if t.done { c(theme::DONE) } else { rgb(prio_color(t.prio)) })).frame(false));
+                        if pr.clicked() {
+                            let next = (t.prio % 3) + 1; // 1→2→3→1
+                            pending_prio.push((t.id, next));
+                        }
+                        pr.on_hover_text("点击切换优先级");
                     });
                 });
             }
@@ -836,11 +1240,22 @@ impl App {
             self.save_later();
         }
         for id in pending_del { self.db.todos.retain(|x| x.id != id); self.save_later(); }
+        for (id, prio) in pending_prio {
+            if let Some(item) = self.db.todos.iter_mut().find(|x| x.id == id) { item.prio = prio; }
+            self.save_later();
+        }
+        for id in pending_edit_open {
+            self.edit_todo = Some(id);
+            self.edit_text = self.db.todos.iter().find(|x| x.id == id).map(|x| x.text.clone()).unwrap_or_default();
+            self.sel_todo = Some(id);
+            self.edit_rect = None;
+        }
         for (id, txt) in pending_edit {
             if let Some(item) = self.db.todos.iter_mut().find(|x| x.id == id) { item.text = txt; }
             self.edit_todo = None;
             self.save_later();
         }
+        if let Some(p) = pending_ctx { self.ctx(CtxKind::Calendar, p); }
         ui.add_space(2.0);
         ui.label(RichText::new("右键打开编辑 · N 添加待办 · P 新建阶段计划 · Esc 收起").size(10.5).color(c(theme::TEXT3)));
     }
@@ -856,12 +1271,17 @@ impl App {
             if i.consume_key(egui::Modifiers::NONE, egui::Key::Escape) {
                 self.show_ctx = false; self.add_open = false; self.plan_open = false;
                 self.edit_todo = None; self.sel_todo = None; self.edit_rect = None;
+                self.edit_plan_id = None; self.jump_open = false; self.io_open = false;
             }
-            if i.consume_key(egui::Modifiers::NONE, egui::Key::N) { self.open_add(); }
-            if i.consume_key(egui::Modifiers::NONE, egui::Key::P) { self.open_plan_form(); }
-            if i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowLeft) { self.shift_month(-1); }
-            if i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowRight) { self.shift_month(1); }
-            if i.consume_key(egui::Modifiers::NONE, egui::Key::T) { self.goto_today(); }
+            // 编辑/新建/弹窗态：屏蔽 N/P/T 与左右翻页快捷键
+            // 注意必须短路（!editing && consume_key），否则编辑框里输入 n/p/t 会被拦截去触发新建
+            let editing = self.edit_todo.is_some() || self.edit_plan_id.is_some()
+                          || self.jump_open || self.io_open || self.plan_open || self.add_open;
+            if !editing && i.consume_key(egui::Modifiers::NONE, egui::Key::N) { self.open_add(); }
+            if !editing && i.consume_key(egui::Modifiers::NONE, egui::Key::P) { self.open_plan_form(); }
+            if !editing && i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowLeft) { self.shift_month(-1); }
+            if !editing && i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowRight) { self.shift_month(1); }
+            if !editing && i.consume_key(egui::Modifiers::NONE, egui::Key::T) { self.goto_today(); }
         });
     }
 
@@ -974,6 +1394,26 @@ fn trunc(s: &str, n: usize) -> String {
     let ch: Vec<char> = s.chars().collect();
     if ch.len() > n { format!("{}…", ch[..n].iter().collect::<String>()) } else { s.to_string() }
 }
+/// 按可用像素宽度截断文字（含省略号），用于窄格子里的任务条，防止溢出边界
+fn trunc_to_width(ui: &egui::Ui, s: &str, font: FontId, max_w: f32) -> String {
+    if s.is_empty() { return String::new(); }
+    let full_w = ui.fonts(|f| f.layout_no_wrap(s.to_string(), font.clone(), Color32::WHITE))
+        .rect.width();
+    if full_w <= max_w { return s.to_string(); }
+    let ell_w = ui.fonts(|f| f.layout_no_wrap("…".to_string(), font.clone(), Color32::WHITE))
+        .rect.width();
+    let avail = (max_w - ell_w).max(0.0);
+    let mut out = String::new();
+    let mut w = 0.0f32;
+    for ch in s.chars() {
+        let cw = ui.fonts(|f| f.layout_no_wrap(ch.to_string(), font.clone(), Color32::WHITE))
+            .rect.width();
+        if w + cw > avail { break; }
+        w += cw;
+        out.push(ch);
+    }
+    if out.is_empty() { "…".to_string() } else { format!("{}…", out) }
+}
 
 fn main() {
     // 嵌入应用图标（128x128 RGBA，非预乘 alpha）
@@ -986,7 +1426,6 @@ fn main() {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1420.0, 900.0])
             .with_min_inner_size([1080.0, 680.0])
-            .with_maximized(true)
             .with_title("Planum · 计划日历")
             .with_icon(std::sync::Arc::new(icon)),
         ..Default::default()

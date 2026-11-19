@@ -106,3 +106,124 @@ pub const PLAN_COLORS: [[f32;3];8] = [
 pub fn prio_color(p: u8) -> [f32;3] {
     match p { 1 => [1.0,0.49,0.41], 3 => [0.50,0.70,0.88], _ => [0.95,0.63,0.29] }
 }
+
+
+/// 导出文件目录（数据目录下 exports）
+pub fn export_dir() -> PathBuf {
+    let p = data_path().parent().unwrap_or_else(|| std::path::Path::new(".")).join("exports");
+    let _ = fs::create_dir_all(&p);
+    p
+}
+
+/// 按范围过滤待办。scope: day=精确日期, week=该日起7天, month=YYYY-MM, year=YYYY
+pub fn todos_in_scope(db: &Db, scope: &str, center: NaiveDate) -> Vec<Todo> {
+    let ck = dkey(&center);
+    match scope {
+        "week" => {
+            let hi = dkey(&(center + Duration::days(6)));
+            db.todos.iter().filter(|t| t.date.as_str() >= ck.as_str() && t.date.as_str() <= hi.as_str()).cloned().collect()
+        }
+        "month" => {
+            let pre = center.format("%Y-%m").to_string();
+            db.todos.iter().filter(|t| t.date.starts_with(&pre)).cloned().collect()
+        }
+        "year" => {
+            let pre = center.format("%Y").to_string();
+            db.todos.iter().filter(|t| t.date.starts_with(&pre)).cloned().collect()
+        }
+        _ => db.todos.iter().filter(|t| t.date == ck).cloned().collect(),
+    }
+}
+
+/// 可序列化的导出包
+#[derive(Serialize, Deserialize)]
+struct ExportData {
+    scope: String,
+    todos: Vec<Todo>,
+    plans: Vec<Plan>,
+    marks: HashMap<String, bool>,
+}
+
+/// 导出为 JSON（筛选待办 + 覆盖到的阶段计划 + 重点日）
+pub fn export_json(db: &Db, scope: &str, center: NaiveDate) -> String {
+    let todos = todos_in_scope(db, scope, center);
+    let dates: std::collections::HashSet<String> = todos.iter().map(|t| t.date.clone()).collect();
+    let plans: Vec<Plan> = db.plans.iter().filter(|p| {
+        dates.iter().any(|dk| p.start.as_str() <= dk.as_str() && dk.as_str() <= p.end.as_str())
+    }).cloned().collect();
+    let marks: HashMap<String, bool> = db.marks.iter()
+        .filter(|(k, _)| dates.contains(k.as_str())).map(|(k, v)| (k.clone(), *v)).collect();
+    let pack = ExportData { scope: scope.to_string(), todos, plans, marks };
+    serde_json::to_string_pretty(&pack).unwrap_or_default()
+}
+
+/// 从 JSON 导入（按 id 去重合并），返回 (新增待办数, 新增计划数)
+pub fn import_json(db: &mut Db, json: &str) -> Result<(usize, usize), String> {
+    let pack: ExportData = serde_json::from_str(json).map_err(|e| e.to_string())?;
+    let mut nt = 0; let mut np = 0;
+    for t in pack.todos {
+        if !db.todos.iter().any(|x| x.id == t.id) { db.todos.push(t); nt += 1; }
+    }
+    for p in pack.plans {
+        if !db.plans.iter().any(|x| x.id == p.id) { db.plans.push(p); np += 1; }
+    }
+    for (k, v) in pack.marks { db.marks.entry(k).or_insert(v); }
+    Ok((nt, np))
+}
+
+
+/// 导出为 Markdown：按日期分组，同一天的计划合并到一个日期标题下，不含 id。
+/// 阶段计划单独一节。
+pub fn export_markdown(db: &Db, scope: &str, center: NaiveDate) -> String {
+    let todos = todos_in_scope(db, scope, center);
+    let mut out = String::new();
+    let scope_name = match scope {
+        "day" => "当日", "week" => "本周", "month" => "本月", "year" => "本年", _ => "计划"
+    };
+    out.push_str(&format!("# {}计划 · {}\n\n", scope_name, dkey(&center)));
+
+    // 按日期分组（BTreeMap 天然按日期升序）
+    let mut by_day: std::collections::BTreeMap<String, Vec<&Todo>> = std::collections::BTreeMap::new();
+    for t in &todos { by_day.entry(t.date.clone()).or_default().push(t); }
+    if by_day.is_empty() {
+        out.push_str("_（该范围内没有每日计划）_\n\n");
+    } else {
+        out.push_str("## 每日计划\n\n");
+        for (day, list) in by_day {
+            out.push_str(&format!("### {}\n\n", day));
+            for t in list {
+                let mark = if t.done { "x" } else { " " };
+                let prio = ["", "高", "中", "低"][t.prio as usize];
+                out.push_str(&format!("- [{}] {}（{}）\n", mark, t.text, prio));
+            }
+            out.push('\n');
+        }
+    }
+
+    // 关联到的阶段计划（覆盖范围内任一天）
+    let dates: std::collections::HashSet<&str> = todos.iter().map(|t| t.date.as_str()).collect();
+    let plans: Vec<&Plan> = db.plans.iter().filter(|pl| {
+        dates.iter().any(|dk| pl.start.as_str() <= *dk && *dk <= pl.end.as_str())
+    }).collect();
+    if !plans.is_empty() {
+        out.push_str("## 阶段计划\n\n");
+        for pl in plans {
+            out.push_str(&format!("- **{}**（{} → {}）\n", pl.name, pl.start, pl.end));
+        }
+        out.push('\n');
+    }
+
+    // 重点日备注
+    let marked: Vec<(&String, &bool)> = db.marks.iter()
+        .filter(|(k, v)| dates.contains(k.as_str()) && **v)
+        .collect();
+    if !marked.is_empty() {
+        out.push_str("## 重点日\n\n");
+        for (k, _) in marked {
+            let note = db.mark_notes.get(k.as_str()).map(|x| x.as_str()).unwrap_or("");
+            if note.is_empty() { out.push_str(&format!("- ★ {}\n", k)); }
+            else { out.push_str(&format!("- ★ {}：{}\n", k, note)); }
+        }
+    }
+    out
+}
