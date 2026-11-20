@@ -143,6 +143,8 @@ struct App {
     course_start: String,
     course_end: String,
     course_place: String,
+    course_color: [f32; 3],
+    course_slot_idx: usize,
     focus_course: bool,
     // 时间段设置面板
     slot_open: bool,
@@ -207,10 +209,15 @@ impl App {
                 }
             }
         }
+        let db = data::load();
+        let start_week = db.default_week_view;
+        // 周视图启动定位到"今天所在周"，月视图定位到月初
+        let start_view = if start_week { today }
+                         else { NaiveDate::from_ymd_opt(today.year(), today.month(), 1).unwrap() };
         Self {
             dwm_applied: false,
-            db: data::load(),
-            view: NaiveDate::from_ymd_opt(today.year(), today.month(), 1).unwrap(),
+            db,
+            view: start_view,
             selected: today,
             today,
             add_prio: 2,
@@ -236,7 +243,7 @@ impl App {
             io_format: IoFormat::Markdown,
             io_date: dkey(&today),
             io_msg: String::new(),
-            week_view: false,
+            week_view: start_week,
             add_start: String::new(),
             add_end: String::new(),
             course_open: false,
@@ -246,6 +253,8 @@ impl App {
             course_start: "08:00".into(),
             course_end: "09:40".into(),
             course_place: String::new(),
+            course_color: data::default_course_color(),
+            course_slot_idx: 0,
             focus_course: false,
             slot_open: false,
             slot_draft: Vec::new(),
@@ -343,12 +352,22 @@ impl App {
         self.course_open = true; self.focus_course = true; self.course_edit_id = id;
         if let Some(id) = id {
             if let Some(c) = self.db.courses.iter().find(|c| c.id == id).cloned() {
+                self.course_color = c.color;
+                // 匹配已有时间段索引（先算再移动 c.start/c.end）
+                let slots = self.db.slots();
+                self.course_slot_idx = slots.iter().position(|sl| sl.start == c.start && sl.end == c.end)
+                    .unwrap_or(0);
                 self.course_name = c.name; self.course_wd = c.weekday;
                 self.course_start = c.start; self.course_end = c.end; self.course_place = c.place;
             }
         } else {
             self.course_name.clear(); self.course_wd = (self.selected.weekday().num_days_from_sunday() as u8);
-            self.course_start = "08:00".into(); self.course_end = "09:40".into(); self.course_place.clear();
+            let slots = self.db.slots();
+            self.course_slot_idx = 0;
+            self.course_start = slots.get(0).map(|x| x.start.clone()).unwrap_or_else(|| "08:00".into());
+            self.course_end = slots.get(0).map(|x| x.end.clone()).unwrap_or_else(|| "09:40".into());
+            self.course_place.clear();
+            self.course_color = data::default_course_color();
         }
     }
     fn save_course(&mut self) {
@@ -361,12 +380,16 @@ impl App {
             if let Some(c) = self.db.courses.iter_mut().find(|c| c.id == id) {
                 c.name = name.to_string(); c.weekday = self.course_wd;
                 c.start = st; c.end = en; c.place = self.course_place.trim().to_string();
+                c.color = self.course_color;
             }
         } else {
+            // 同名日程沿用已存在的颜色
+            let col = self.db.courses.iter().find(|c| c.name == name)
+                .map(|c| c.color).unwrap_or(self.course_color);
             self.db.courses.push(data::Course {
                 id: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64,
                 name: name.to_string(), weekday: self.course_wd, start: st, end: en,
-                place: self.course_place.trim().to_string(),
+                place: self.course_place.trim().to_string(), color: col,
             });
         }
         self.course_open = false; self.save_later();
@@ -914,7 +937,7 @@ impl App {
                     self.week_view = !self.week_view;
                     if self.week_view { self.view = self.selected; } // 切到周视图时定位到选中日期所在周
                 }
-                if ui.add_sized([44.0, 26.0], egui::Button::new("课程")).on_hover_text("管理每周重复课程").clicked() {
+                if ui.add_sized([44.0, 26.0], egui::Button::new("日程")).on_hover_text("管理每周重复日程").clicked() {
                     self.open_course_form(None);
                 }
                 if ui.add_sized([44.0, 26.0], egui::Button::new("时段")).on_hover_text("自定义周视图时间段").clicked() {
@@ -958,6 +981,22 @@ impl App {
                                 .frame(self.db.week_start_sunday == *v)).clicked() { self.db.week_start_sunday = *v; self.save_later(); }
                         }
                         ui.add_space(8.0);
+                        ui.label(RichText::new("默认视图:").size(11.0).color(c(theme::TEXT3)));
+                        for (nm, v) in [("月", false), ("周", true)].iter() {
+                            if ui.add(egui::Button::new(RichText::new(*nm).size(10.5))
+                                .frame(self.db.default_week_view == *v)).clicked() {
+                                self.db.default_week_view = *v; self.week_view = *v;
+                                if *v { self.view = self.today; } else {
+                                    self.view = NaiveDate::from_ymd_opt(self.today.year(), self.today.month(), 1).unwrap();
+                                }
+                                self.save_later();
+                            }
+                        }
+                        ui.label(RichText::new("卡片文字:").size(11.0).color(c(theme::TEXT3)));
+                        for (nm, v) in [("居中", true), ("左对齐", false)].iter() {
+                            if ui.add(egui::Button::new(RichText::new(*nm).size(10.5))
+                                .frame(self.db.card_center == *v)).clicked() { self.db.card_center = *v; self.save_later(); }
+                        }
                         if ui.add(egui::Checkbox::new(&mut self.db.color_by_schedule,
                             RichText::new("方块颜色跟随日程").size(11.0))).changed() { self.save_later(); }
                     });
@@ -1017,7 +1056,7 @@ impl App {
                                 self.io_msg = "已取消导入".into();
                             }
                         }
-                        if ui.button("导入课表…").on_hover_text("从 JSON 导入每周重复课程").clicked() { self.import_courses(); }
+                        if ui.button("导入日程…").on_hover_text("从 JSON 导入每周重复日程").clicked() { self.import_courses(); }
                         if ui.button("课表模板…").on_hover_text("导出一份带示例的课表 JSON").clicked() {
                             let tpl = r#"{"courses":[{"name":"高等数学","weekday":1,"start":"08:00","end":"09:40","place":"A301"},{"name":"英语","weekday":2,"start":"10:00","end":"11:40","place":"B205"}]}"#;
                             if let Some(path) = rfd::FileDialog::new().set_title("保存课表模板").set_file_name("planum_courses.json")
@@ -1040,7 +1079,7 @@ impl App {
             egui::Frame::none().fill(c(theme::CARD)).rounding(Rounding::same(radius::SM))
                 .inner_margin(Margin::symmetric(8.0, 6.0)).show(ui, |ui| {
                     ui.horizontal(|ui| {
-                        ui.label(RichText::new(if self.course_edit_id.is_some() { "编辑课程" } else { "添加课程" })
+                        ui.label(RichText::new(if self.course_edit_id.is_some() { "编辑日程" } else { "添加日程" })
                             .size(12.0).strong().color(c(theme::ACCENT2)));
                         ui.label(RichText::new("星期:").size(11.0).color(c(theme::TEXT2)));
                         for wd in 0u8..7 {
@@ -1053,10 +1092,32 @@ impl App {
                         let r = ui.add(egui::TextEdit::singleline(&mut self.course_name)
                             .hint_text("课程名，如「高等数学」").desired_width((ui.available_width()-240.0).max(80.0)));
                         if self.focus_course { r.request_focus(); self.focus_course = false; }
-                        ui.add(egui::TextEdit::singleline(&mut self.course_start).hint_text("08:00").desired_width(56.0));
-                        ui.label(RichText::new("–").size(11.0).color(c(theme::TEXT3)));
-                        ui.add(egui::TextEdit::singleline(&mut self.course_end).hint_text("09:40").desired_width(56.0));
+                        // 选已有时间段（选中后自动填起止）
+                        let slots = self.db.slots();
+                        let cur_label = slots.get(self.course_slot_idx)
+                            .map(|s| format!("{}-{}", s.start, s.end)).unwrap_or_else(|| "自定义".into());
+                        egui::ComboBox::from_id_source("course_slot_combo").selected_text(cur_label).show_ui(ui, |ui| {
+                            for (i, sl) in slots.iter().enumerate() {
+                                if ui.selectable_value(&mut self.course_slot_idx, i,
+                                    format!("{}-{}", sl.start, sl.end)).clicked() {
+                                    self.course_start = sl.start.clone(); self.course_end = sl.end.clone();
+                                }
+                            }
+                        });
                         ui.add(egui::TextEdit::singleline(&mut self.course_place).hint_text("地点").desired_width(70.0));
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("颜色:").size(11.0).color(c(theme::TEXT3)));
+                        for (i, col) in data::PLAN_COLORS.iter().enumerate() {
+                            let size = 18.0;
+                            let (rect, resp) = ui.allocate_exact_size(Vec2::new(size, size), egui::Sense::click());
+                            let filled = (self.course_color[0]-col[0]).abs()<0.01
+                                      && (self.course_color[1]-col[1]).abs()<0.01
+                                      && (self.course_color[2]-col[2]).abs()<0.01;
+                            ui.painter().rect_filled(rect, Rounding::same(3.0), rgb(*col));
+                            if filled { ui.painter().rect_stroke(rect.expand(2.0), Rounding::same(4.0), Stroke::new(2.0, c(theme::TEXT))); }
+                            if resp.clicked() { self.course_color = *col; let _ = i; }
+                        }
                     });
                     ui.horizontal(|ui| {
                         if ui.button("保存").clicked() { self.save_course(); }
@@ -1196,7 +1257,7 @@ impl App {
             let mut items: Vec<Item> = Vec::new();
             for co in self.db.courses_on(wd) {
                 items.push(Item { start: co.start.clone(), end: co.end.clone(),
-                    text: co.name.clone(), color: c(theme::ACCENT2), is_course: true });
+                    text: co.name.clone(), color: rgb(co.color), is_course: true });
             }
             for t in self.db.todos_of(&dk) {
                 if !t.start.is_empty() {
@@ -1223,17 +1284,41 @@ impl App {
                     ui.painter().rect_filled(cr, Rounding::same(4.0), fill);
                     ui.painter().rect_stroke(cr, Rounding::same(4.0), Stroke::new(1.0, stroke_col));
                 }
-                ui.allocate_ui_at_rect(cr, |ui| {
-                    ui.spacing_mut().item_spacing.y = 1.0;
-                    for it in in_slot.iter().take(3) {
-                        let label = trunc_to_width(ui, &it.text, FontId::proportional(9.5), col_w - 5.0);
-                        let line = if it.end.is_empty() { label } else { format!("{} {}", it.start, label) };
-                        let txt = if it.is_course { RichText::new(line).size(9.5).color(it.color).strong() }
-                                  else { RichText::new(line).size(9.5).color(it.color) };
-                        ui.add(egui::Label::new(txt).truncate());
+                // 日程按数量平分卡片高度：单个占满卡片（字号≈卡片高度80%）居中，每多一个平分一次
+                let show_n = in_slot.len().min(3);
+                if show_n > 0 {
+                    let band = cr.height() / show_n as f32;
+                    for (i, it) in in_slot.iter().take(3).enumerate() {
+                        let band_top = cr.top() + i as f32 * band;
+                        let band_mid = band_top + band / 2.0;
+                        // 字号随 band 缩放：单项≈卡片80%，多项平分后自动缩小
+                        let name_fs = (band * 0.62).clamp(12.0, 40.0);
+                        let time_fs = (name_fs * 0.42).clamp(8.0, 14.0);
+                        let name = trunc_to_width(ui, &it.text, FontId::proportional(name_fs), col_w - 12.0);
+                        let has_time = !it.start.is_empty();
+                        // 名字 + 时间整体在 band 内垂直居中
+                        let (name_y, time_y) = if has_time {
+                            let total = name_fs + time_fs;
+                            (band_mid - total / 2.0 + name_fs / 2.0,
+                             band_mid - total / 2.0 + name_fs + time_fs / 2.0)
+                        } else { (band_mid, band_mid) };
+                        // 卡片文字对齐：设置里可切换 居中 / 左对齐
+                        let center = self.db.card_center;
+                        let tx = if center { cr.center().x } else { cr.left() + 8.0 };
+                        let align = if center { Align2::CENTER_CENTER } else { Align2::LEFT_CENTER };
+                        ui.painter().text(Pos2::new(tx, name_y),
+                            align, &name, FontId::proportional(name_fs), it.color);
+                        if has_time {
+                            ui.painter().text(Pos2::new(tx, time_y), align,
+                                format!("{}-{}", it.start, it.end), FontId::proportional(time_fs), c(theme::TEXT3));
+                        }
                     }
-                    if in_slot.len() > 3 { ui.label(RichText::new(format!("+{}", in_slot.len()-3)).size(8.5).color(c(theme::TEXT3))); }
-                });
+                    if in_slot.len() > 3 {
+                        ui.painter().text(Pos2::new(cr.right() - 4.0, cr.bottom() - 2.0),
+                            Align2::RIGHT_BOTTOM, format!("+{}", in_slot.len()-3),
+                            FontId::proportional(9.0), c(theme::TEXT3));
+                    }
+                }
             }
             // 全天待办区：该天未设时段的待办（最多 2 条 + N）
             let all_todos: Vec<_> = self.db.todos_of(&dk).into_iter().filter(|t| t.start.is_empty()).collect();
@@ -1316,6 +1401,40 @@ impl App {
                             [rect.left_top() + Vec2::new(9.0, 0.0), rect.right_top() - Vec2::new(9.0, 0.0)],
                             Stroke::new(1.5, ca(theme::ACCENT, 130)),
                         );
+                    }
+                    // ── 当日日程关键字：彩色小方块 + 名字关键字，跟随日程色 ──
+                    // 日程 = 带时间的每日计划（课程 + 带 start 的待办）
+                    let mut agenda_kw: Vec<(String, Color32)> = Vec::new();
+                    for co in self.db.courses_on(d.weekday().num_days_from_sunday() as u8) {
+                        agenda_kw.push((co.name.chars().take(2).collect(), rgb(co.color)));
+                    }
+                    for t in todos.iter().filter(|t| !t.start.is_empty()) {
+                        agenda_kw.push((t.text.chars().take(2).collect(),
+                            if t.done { c(theme::DONE) } else { rgb(prio_color(t.prio)) }));
+                    }
+                    let ak = agenda_kw.len().min(2);
+                    if ak > 0 {
+                        let kw_fs = 8.5f32;
+                        let pad = 3.0f32;
+                        // 先量每个关键字宽度，整体居中
+                        let kw_widths: Vec<f32> = agenda_kw.iter().take(ak).map(|(txt,_)| {
+                            ui.fonts(|f| f.layout_no_wrap(txt.clone(), FontId::proportional(kw_fs), Color32::WHITE)).rect.width() + pad*2.0
+                        }).collect();
+                        let total: f32 = kw_widths.iter().sum::<f32>() + (ak as f32 - 1.0) * 2.0;
+                        let start_x = rect.center().x - total / 2.0;
+                        let by = rect.bottom() - 22.0;
+                        let mut cur_x = start_x;
+                        for (i, (txt, col)) in agenda_kw.iter().take(ak).enumerate() {
+                            let w = kw_widths[i];
+                            let kr = egui::Rect::from_min_size(Pos2::new(cur_x, by), Vec2::new(w, 13.0));
+                            ui.painter().rect_filled(kr, Rounding::same(3.0),
+                                Color32::from_rgba_unmultiplied(col.r(), col.g(), col.b(), 50));
+                            ui.painter().rect_stroke(kr, Rounding::same(3.0),
+                                Stroke::new(0.8, Color32::from_rgba_unmultiplied(col.r(), col.g(), col.b(), 160)));
+                            ui.painter().text(kr.center(), Align2::CENTER_CENTER, txt,
+                                FontId::proportional(kw_fs), *col);
+                            cur_x += w + 2.0;
+                        }
                     }
                     // 阶段计划标记：小型彩色方块，水平并排在格子底部居中（不遮挡两侧信息）
                     let n = plans.len().min(5);
@@ -1605,7 +1724,7 @@ impl App {
             let mut rows: Vec<Row> = Vec::new();
             for c0 in self.db.courses_on(self.selected.weekday().num_days_from_sunday() as u8) {
                 rows.push(Row { start:c0.start.clone(), end:c0.end.clone(), text:c0.name.clone(),
-                    col:c(theme::ACCENT2), course:true, id:c0.id });
+                    col:rgb(c0.color), course:true, id:c0.id });
             }
             for t in self.db.todos_of(&k) {
                 if !t.start.is_empty() {

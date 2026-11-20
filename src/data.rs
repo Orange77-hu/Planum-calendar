@@ -32,6 +32,8 @@ pub struct Course {
     pub start: String,
     pub end: String,
     #[serde(default)] pub place: String,
+    /// 日程颜色 rgb 0..1（同名课程同色）
+    #[serde(default = "default_course_color")] pub color: [f32; 3],
 }
 
 /// 周视图时间段卡片（所有天共用同一组，数量可自定义）
@@ -70,6 +72,10 @@ pub struct Db {
     #[serde(default = "default_color_by_schedule")] pub color_by_schedule: bool,
     /// 周视图一周起点：true=周日开始, false=周一开始
     #[serde(default = "default_week_start_sunday")] pub week_start_sunday: bool,
+    /// 启动默认视图：true=周视图, false=月视图
+    #[serde(default)] pub default_week_view: bool,
+    /// 周视图时段卡片文字：true=居中, false=左对齐
+    #[serde(default = "default_card_center")] pub card_center: bool,
 }
 
 impl Db {
@@ -99,6 +105,8 @@ impl Db {
             schedule_by_time: true,
             color_by_schedule: true,
             week_start_sunday: false,
+            default_week_view: false,
+            card_center: true,
         };
         db.marks.insert(dk(1), true);
         db.marks.insert(dk(4), true);
@@ -141,6 +149,15 @@ impl Db {
 }
 
 fn default_week_start_sunday() -> bool { false }
+
+/// 日程默认色（未指定颜色时用）
+pub fn default_course_color() -> [f32; 3] { [0.95, 0.63, 0.29] }
+
+/// 按索引取色板颜色（同名课程共用同一索引 = 同色）
+pub fn color_for_course_index(idx: usize, palette: &[[f32; 3]]) -> [f32; 3] {
+    palette[idx % palette.len()]
+}
+fn default_card_center() -> bool { true }
 fn default_plan_by_time() -> bool { false }
 fn default_schedule_by_time() -> bool { true }
 fn default_color_by_schedule() -> bool { true }
@@ -183,10 +200,19 @@ pub fn import_courses(json: &str) -> Result<Vec<Course>, String> {
         out.push(Course {
             id: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64 + i as u64,
             name: name.to_string(), weekday, start, end,
-            place: place.to_string(),
+            place: place.to_string(), color: default_course_color(),
         });
     }
-    if out.is_empty() { return Err("未解析到有效课程（需 name/start/end）".into()); }
+    if out.is_empty() { return Err("未解析到有效日程（需 name/start/end）".into()); }
+    // 同名同色、不同名不同色：按课程名首次出现顺序分配色板槽位
+    let mut name_color: std::collections::HashMap<String, [f32; 3]> = std::collections::HashMap::new();
+    for c in out.iter_mut() {
+        let n = name_color.len();
+        let col = *name_color.entry(c.name.clone()).or_insert_with(|| {
+            color_for_course_index(n, &PLAN_COLORS)
+        });
+        c.color = col;
+    }
     Ok(out)
 }
 
