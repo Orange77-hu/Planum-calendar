@@ -1623,9 +1623,11 @@ impl App {
             for r0 in &rows {
                 ui.horizontal(|ui| {
                     ui.label(RichText::new(format!("{}-{}", r0.start, r0.end)).size(10.5).color(c(theme::TEXT3)));
-                    let mark = if r0.course { "▮" } else { "▪" };
+                    // 手绘小色条代替 ▮/▪ 字符（字符会被渲染成实心方块像乱码）
+                    let bar = ui.allocate_response(Vec2::new(3.0, 14.0), egui::Sense::hover()).rect;
+                    ui.painter().rect_filled(bar, Rounding::same(1.5), r0.col);
                     let txt = trunc_to_width(ui, &r0.text, FontId::proportional(11.0), (ui.available_width() - 90.0).max(40.0));
-                    ui.label(RichText::new(format!("{} {}", mark, txt)).size(11.5).color(r0.col).strong());
+                    ui.label(RichText::new(txt).size(11.5).color(r0.col).strong());
                     if r0.course && ui.button("编辑").clicked() { edit_course_click = Some(r0.id); }
                 });
             }
