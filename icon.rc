@@ -1,0 +1,3 @@
+// Windows exe 图标资源（资源管理器 / 任务栏固定项显示）
+// 1 = 主图标 ID；绝对路径由 build.rs 通过 embed_resource 处理（相对 build.rs 所在目录）
+1 ICON "icon.ico"
