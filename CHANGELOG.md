@@ -2,6 +2,16 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/) 格式，版本号遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/)。
 
+## [1.1.1] - 2026-11-20
+
+### Added
+- 日程支持生效起止日期（手动添加表单可选、JSON 导入可带 `start_date`/`end_date`），过期日程自动不显示
+- 完整课表 JSON 模板导出：含 weekday/day、时段、地点、生效日期示例与字段说明
+- 周视图时段卡片右键菜单：直接编辑 / 删除该日程
+
+### Fixed
+- exe 内嵌 Windows 图标资源（资源管理器/任务栏正确显示）
+
 ## [1.1.0] - 2026-11-20
 
 ### Added
@@ -39,5 +49,6 @@
 - 计划文字按格子实际像素宽度动态截断，窗口缩小不溢出
 - 高亮框支持多行文字整体框选，不遮挡优先级标签
 
+[1.1.1]: https://github.com/Orange77-hu/Planum-calendar/releases/tag/v1.1.1
 [1.1.0]: https://github.com/Orange77-hu/Planum-calendar/releases/tag/v1.1.0
 [1.0.0]: https://github.com/Orange77-hu/Planum-calendar/releases/tag/v1.0.0

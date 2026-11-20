@@ -32,6 +32,9 @@ pub struct Course {
     pub start: String,
     pub end: String,
     #[serde(default)] pub place: String,
+    /// 生效起止日期 YYYY-MM-DD（空串=永久有效）
+    #[serde(default)] pub start_date: String,
+    #[serde(default)] pub end_date: String,
     /// 日程颜色 rgb 0..1（同名课程同色）
     #[serde(default = "default_course_color")] pub color: [f32; 3],
 }
@@ -132,8 +135,15 @@ impl Db {
         v
     }
     /// 某天的课程（按周几匹配，按开始时间排序）
-    pub fn courses_on(&self, weekday: u8) -> Vec<&Course> {
-        let mut v: Vec<&Course> = self.courses.iter().filter(|c| c.weekday == weekday).collect();
+    /// 某天的课程：按周几匹配 + 生效日期范围过滤（date_key="" 不过滤日期）
+    pub fn courses_on(&self, weekday: u8, date_key: &str) -> Vec<&Course> {
+        let mut v: Vec<&Course> = self.courses.iter().filter(|c| {
+            if c.weekday != weekday { return false; }
+            if date_key.is_empty() { return true; }
+            if !c.start_date.is_empty() && date_key < c.start_date.as_str() { return false; }
+            if !c.end_date.is_empty() && date_key > c.end_date.as_str() { return false; }
+            true
+        }).collect();
         v.sort_by(|a,b| a.start.cmp(&b.start).then(a.id.cmp(&b.id)));
         v
     }
@@ -197,10 +207,14 @@ pub fn import_courses(json: &str) -> Result<Vec<Course>, String> {
         let start = g("start").to_string(); let end = g("end").to_string();
         if start.is_empty() || end.is_empty() { continue; }
         let place = if !g("place").is_empty() { g("place") } else { g("location") };
+        // 生效日期范围（可选）；兼容 start_date/date_start 与 end_date/date_end
+        let sd = if !g("start_date").is_empty() { g("start_date") } else { g("date_start") };
+        let ed = if !g("end_date").is_empty() { g("end_date") } else { g("date_end") };
         out.push(Course {
             id: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64 + i as u64,
             name: name.to_string(), weekday, start, end,
-            place: place.to_string(), color: default_course_color(),
+            place: place.to_string(), start_date: sd.to_string(), end_date: ed.to_string(),
+            color: default_course_color(),
         });
     }
     if out.is_empty() { return Err("未解析到有效日程（需 name/start/end）".into()); }

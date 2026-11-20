@@ -143,6 +143,8 @@ struct App {
     course_start: String,
     course_end: String,
     course_place: String,
+    course_start_date: String,
+    course_end_date: String,
     course_color: [f32; 3],
     course_slot_idx: usize,
     focus_course: bool,
@@ -176,7 +178,7 @@ struct App {
 }
 
 #[derive(Clone, Copy, PartialEq)]
-enum CtxKind { None, PlanZone, Calendar }
+enum CtxKind { None, PlanZone, Calendar, Course(u64) }
 
 /// 导入/导出范围
 #[derive(Clone, Copy, PartialEq)]
@@ -253,6 +255,8 @@ impl App {
             course_start: "08:00".into(),
             course_end: "09:40".into(),
             course_place: String::new(),
+            course_start_date: String::new(),
+            course_end_date: String::new(),
             course_color: data::default_course_color(),
             course_slot_idx: 0,
             focus_course: false,
@@ -359,6 +363,7 @@ impl App {
                     .unwrap_or(0);
                 self.course_name = c.name; self.course_wd = c.weekday;
                 self.course_start = c.start; self.course_end = c.end; self.course_place = c.place;
+                self.course_start_date = c.start_date.clone(); self.course_end_date = c.end_date.clone();
             }
         } else {
             self.course_name.clear(); self.course_wd = (self.selected.weekday().num_days_from_sunday() as u8);
@@ -367,6 +372,7 @@ impl App {
             self.course_start = slots.get(0).map(|x| x.start.clone()).unwrap_or_else(|| "08:00".into());
             self.course_end = slots.get(0).map(|x| x.end.clone()).unwrap_or_else(|| "09:40".into());
             self.course_place.clear();
+            self.course_start_date.clear(); self.course_end_date.clear();
             self.course_color = data::default_course_color();
         }
     }
@@ -380,6 +386,8 @@ impl App {
             if let Some(c) = self.db.courses.iter_mut().find(|c| c.id == id) {
                 c.name = name.to_string(); c.weekday = self.course_wd;
                 c.start = st; c.end = en; c.place = self.course_place.trim().to_string();
+                c.start_date = self.course_start_date.trim().to_string();
+                c.end_date = self.course_end_date.trim().to_string();
                 c.color = self.course_color;
             }
         } else {
@@ -389,7 +397,9 @@ impl App {
             self.db.courses.push(data::Course {
                 id: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64,
                 name: name.to_string(), weekday: self.course_wd, start: st, end: en,
-                place: self.course_place.trim().to_string(), color: col,
+                place: self.course_place.trim().to_string(),
+                start_date: self.course_start_date.trim().to_string(),
+                end_date: self.course_end_date.trim().to_string(), color: col,
             });
         }
         self.course_open = false; self.save_later();
@@ -1058,11 +1068,40 @@ impl App {
                         }
                         if ui.button("导入日程…").on_hover_text("从 JSON 导入每周重复日程").clicked() { self.import_courses(); }
                         if ui.button("课表模板…").on_hover_text("导出一份带示例的课表 JSON").clicked() {
-                            let tpl = r#"{"courses":[{"name":"高等数学","weekday":1,"start":"08:00","end":"09:40","place":"A301"},{"name":"英语","weekday":2,"start":"10:00","end":"11:40","place":"B205"}]}"#;
+                            let tpl = r#"{
+  "courses": [
+    {
+      "name": "高等数学",
+      "weekday": 1,
+      "start": "08:00",
+      "end": "09:40",
+      "place": "A301",
+      "start_date": "2026-09-01",
+      "end_date": "2027-01-15"
+    },
+    {
+      "name": "英语二",
+      "weekday": 2,
+      "start": "10:00",
+      "end": "11:40",
+      "place": "B205",
+      "start_date": "",
+      "end_date": ""
+    },
+    {
+      "name": "模电",
+      "day": 3,
+      "start": "14:00",
+      "end": "15:40",
+      "place": "实验楼 201"
+    }
+  ]
+}
+"#;
                             if let Some(path) = rfd::FileDialog::new().set_title("保存课表模板").set_file_name("planum_courses.json")
                                 .add_filter("JSON", &["json"]).save_file() {
                                 match std::fs::write(&path, tpl) {
-                                    Ok(_) => self.io_msg = format!("模板已保存: {}", path.file_name().unwrap_or_default().to_string_lossy()),
+                                    Ok(_) => self.io_msg = "模板已保存：weekday 0=周日..6=周六（或用 day 1=周一..7=周日）；start/end 是每天时段；start_date/end_date 是生效日期范围，留空=永久".into(),
                                     Err(e) => self.io_msg = format!("保存失败: {}", e),
                                 }
                             }
@@ -1105,6 +1144,13 @@ impl App {
                             }
                         });
                         ui.add(egui::TextEdit::singleline(&mut self.course_place).hint_text("地点").desired_width(70.0));
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("生效日期:").size(11.0).color(c(theme::TEXT3)));
+                        ui.add(egui::TextEdit::singleline(&mut self.course_start_date).hint_text("起 YYYY-MM-DD").desired_width(110.0));
+                        ui.label(RichText::new("–").size(11.0).color(c(theme::TEXT3)));
+                        ui.add(egui::TextEdit::singleline(&mut self.course_end_date).hint_text("止 YYYY-MM-DD").desired_width(110.0));
+                        ui.label(RichText::new("留空=永久").size(9.5).color(c(theme::TEXT3)));
                     });
                     ui.horizontal(|ui| {
                         ui.label(RichText::new("颜色:").size(11.0).color(c(theme::TEXT3)));
@@ -1253,15 +1299,15 @@ impl App {
             let wd = d.weekday().num_days_from_sunday() as u8; // 真实星期：0=周日
             let x = base_x + lab_w + gap + di as f32 * (col_w + gap);
             // 该天所有有时段的项：课程 + 待办
-            struct Item { start: String, end: String, text: String, color: Color32, is_course: bool }
+            struct Item { id: u64, start: String, end: String, text: String, color: Color32, is_course: bool }
             let mut items: Vec<Item> = Vec::new();
-            for co in self.db.courses_on(wd) {
-                items.push(Item { start: co.start.clone(), end: co.end.clone(),
+            for co in self.db.courses_on(wd, &dk) {
+                items.push(Item { id: co.id, start: co.start.clone(), end: co.end.clone(),
                     text: co.name.clone(), color: rgb(co.color), is_course: true });
             }
             for t in self.db.todos_of(&dk) {
                 if !t.start.is_empty() {
-                    items.push(Item { start: t.start.clone(), end: t.end.clone(), text: t.text.clone(),
+                    items.push(Item { id: t.id, start: t.start.clone(), end: t.end.clone(), text: t.text.clone(),
                         color: if t.done { c(theme::DONE) } else { rgb(prio_color(t.prio)) }, is_course: false });
                 }
             }
@@ -1291,6 +1337,15 @@ impl App {
                     for (i, it) in in_slot.iter().take(3).enumerate() {
                         let band_top = cr.top() + i as f32 * band;
                         let band_mid = band_top + band / 2.0;
+                        // 右键课程方块 → 弹出日程编辑菜单（待办仍用日历右键菜单）
+                        if it.is_course {
+                            let item_rect = egui::Rect::from_min_size(Pos2::new(cr.left(), band_top),
+                                Vec2::new(cr.width(), band));
+                            if ui.rect_contains_pointer(item_rect)
+                               && ui.ctx().input(|i| i.pointer.button_clicked(egui::PointerButton::Secondary)) {
+                                self.ctx(CtxKind::Course(it.id), ui_pos(ui));
+                            }
+                        }
                         // 字号随 band 缩放：单项≈卡片80%，多项平分后自动缩小
                         let name_fs = (band * 0.62).clamp(12.0, 40.0);
                         let time_fs = (name_fs * 0.42).clamp(8.0, 14.0);
@@ -1405,7 +1460,7 @@ impl App {
                     // ── 当日日程关键字：彩色小方块 + 名字关键字，跟随日程色 ──
                     // 日程 = 带时间的每日计划（课程 + 带 start 的待办）
                     let mut agenda_kw: Vec<(String, Color32)> = Vec::new();
-                    for co in self.db.courses_on(d.weekday().num_days_from_sunday() as u8) {
+                    for co in self.db.courses_on(d.weekday().num_days_from_sunday() as u8, &dkey(&d)) {
                         agenda_kw.push((co.name.chars().take(2).collect(), rgb(co.color)));
                     }
                     for t in todos.iter().filter(|t| !t.start.is_empty()) {
@@ -1722,7 +1777,7 @@ impl App {
             // 课程 + 带时段待办，按开始时间排序
             #[derive(Clone)] struct Row { start: String, end: String, text: String, col: Color32, course: bool, id: u64 }
             let mut rows: Vec<Row> = Vec::new();
-            for c0 in self.db.courses_on(self.selected.weekday().num_days_from_sunday() as u8) {
+            for c0 in self.db.courses_on(self.selected.weekday().num_days_from_sunday() as u8, &k) {
                 rows.push(Row { start:c0.start.clone(), end:c0.end.clone(), text:c0.name.clone(),
                     col:rgb(c0.color), course:true, id:c0.id });
             }
@@ -1840,6 +1895,13 @@ impl App {
                             self.save_later(); close = true;
                         }
                         if ctx_btn(ui, "回到今天") { self.goto_today(); close = true; }
+                    }
+                    CtxKind::Course(id) => {
+                        ui.label(RichText::new("日程").size(10.0).color(c(theme::TEXT3)));
+                        if ctx_btn(ui, "✎  编辑这个日程") { self.open_course_form(Some(id)); close = true; }
+                        if ctx_btn(ui, "×  删除这个日程") {
+                            self.db.courses.retain(|c| c.id != id); self.save_later(); close = true;
+                        }
                     }
                     CtxKind::None => {}
                 }
