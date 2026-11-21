@@ -2,6 +2,11 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/) 格式，版本号遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/)。
 
+## [1.2.2] - 2026-11-21
+
+### Changed
+- AI 导入提示词：课表未指定开学日期时，按秋季 9 月 1 日 / 春季 2 月 28 日为第一周推算生效日期；输出 JSON 后若发现信息缺失，改为简短通知用户哪些字段未从文件读到、采用了什么默认值（不再询问开学日期）
+
 ## [1.2.1] - 2026-11-21
 
 ### Added
@@ -83,6 +88,7 @@
 - 计划文字按格子实际像素宽度动态截断，窗口缩小不溢出
 - 高亮框支持多行文字整体框选，不遮挡优先级标签
 
+[1.2.2]: https://github.com/Orange77-hu/Planum-calendar/releases/tag/v1.2.2
 [1.2.1]: https://github.com/Orange77-hu/Planum-calendar/releases/tag/v1.2.1
 [1.2.0]: https://github.com/Orange77-hu/Planum-calendar/releases/tag/v1.2.0
 [1.1.1]: https://github.com/Orange77-hu/Planum-calendar/releases/tag/v1.1.1
