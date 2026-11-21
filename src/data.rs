@@ -34,6 +34,8 @@ pub struct Course {
     pub start: String,
     pub end: String,
     #[serde(default)] pub place: String,
+    /// 日历方块上显示的短关键词（空则用课程名）
+    #[serde(default)] pub keyword: String,
     /// 生效起止日期 YYYY-MM-DD（空串=永久有效）
     #[serde(default)] pub start_date: String,
     #[serde(default)] pub end_date: String,
@@ -83,7 +85,7 @@ pub struct Db {
     #[serde(default)] pub default_week_view: bool,
     /// 周视图时段卡片文字：true=居中, false=左对齐
     #[serde(default = "default_card_center")] pub card_center: bool,
-    /// 当前皮肤序号（0=曜夜，1=晨雾，2=森屿，3=霞光，4=深海）
+    /// 当前皮肤序号（0=曜夜，1=晨雾，2=森屿，3=霞光，4=深海，5=暖阳，6=星黛，7=青瓷）
     #[serde(default)] pub skin: usize,
 }
 
@@ -256,6 +258,42 @@ pub fn default_slots() -> Vec<Slot> {
     ]
 }
 
+/// 日历方块上的课程标签：填了语义关键词就用关键词，否则退回课程全名
+pub fn course_label(c: &Course) -> String {
+    if c.keyword.trim().is_empty() { c.name.clone() } else { c.keyword.trim().to_string() }
+}
+
+/// 发给 AI 的「课表 → 可导入 JSON」提示词模板。
+/// 用户把这份提示词连同自己的课表文件（截图 / PDF / 照片 / 文字）一起发给 AI，
+/// 再把 AI 回复整段粘进设置面板的粘贴框，点「粘贴并导入」即可，不必另存文件。
+pub fn course_import_prompt() -> &'static str {
+    r#"你是「Planum 计划日历」的课表整理助手。我会附上一份课表文件（截图、照片、PDF 或文字），请把它整理成可以直接导入 Planum 的 JSON。
+
+【输出要求】
+- 只输出一个 JSON 对象，不要任何解释、说明或 Markdown 代码块。
+- 顶层是 {"courses": [...]}，数组里每一条是一节课。
+
+【字段规则】
+- name：课程全名，按文件原文写。
+- weekday：0=周日、1=周一、2=周二……6=周六。也可以改用 day：1=周一……7=周日（两者选一个即可）。
+- start / end：24 小时制 "HH:MM"，如 "08:00" / "09:40"。若文件只写第几节，请换算：第1-2节=08:00-09:40，第3-4节=10:00-11:40，第5-6节=14:00-15:40，第7-8节=16:00-17:40，晚上=19:00-21:00。
+- place：上课教室 / 地点，按文件原文写；文件里没有就填 ""。
+- keyword：按语义生成的短关键词，2~6 个字，用于日历上的彩色小方块。要提炼课程名里最能代表这门课的核心语义，长名字必须缩写，例如：高等数学→高数、线性代数→线代、概率论与数理统计→概率、模拟电子技术基础→模电、数字电子技术基础→数电、大学英语（二）→英语、马克思主义基本原理→马原。不同课程之间要能区分，不要用「课程」「上课」「其他」这类空词；原文件若已有简称就优先用简称。
+- start_date / end_date：学期或课程的生效起止日期，格式 "YYYY-MM-DD"；文件没写就都填 ""（表示永久有效）。
+- color、skip_dates 不用写，程序会自动生成。
+
+【输出示例】
+{
+  "courses": [
+    {"name":"高等数学","weekday":1,"start":"08:00","end":"09:40","place":"A301","keyword":"高数","start_date":"2026-09-01","end_date":"2027-01-15"},
+    {"name":"模拟电子技术基础","day":3,"start":"14:00","end":"15:40","place":"实验楼201","keyword":"模电","start_date":"","end_date":""}
+  ]
+}
+
+【最后检查】
+确认 JSON 合法：全部使用双引号、没有多余逗号、每条都有 name / start / end。"#
+}
+
 /// 从 JSON 导入课表。兼容：顶层数组 / {"courses":[...]}，字段名支持 weekday/day(0=周日或1=周一按 monday1 判定)
 pub fn import_courses(json: &str) -> Result<Vec<Course>, String> {
     #[derive(Deserialize)]
@@ -280,13 +318,16 @@ pub fn import_courses(json: &str) -> Result<Vec<Course>, String> {
         let start = g("start").to_string(); let end = g("end").to_string();
         if start.is_empty() || end.is_empty() { continue; }
         let place = if !g("place").is_empty() { g("place") } else { g("location") };
+        // 短关键词：AI 导入提示词会按语义生成；也兼容 tag 字段
+        let keyword = if !g("keyword").is_empty() { g("keyword") } else { g("tag") };
         // 生效日期范围（可选）；兼容 start_date/date_start 与 end_date/date_end
         let sd = if !g("start_date").is_empty() { g("start_date") } else { g("date_start") };
         let ed = if !g("end_date").is_empty() { g("end_date") } else { g("date_end") };
         out.push(Course {
             id: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64 + i as u64,
             name: name.to_string(), weekday, start, end,
-            place: place.to_string(), start_date: sd.to_string(), end_date: ed.to_string(),
+            place: place.to_string(), keyword: keyword.to_string(),
+            start_date: sd.to_string(), end_date: ed.to_string(),
             color: default_course_color(), skip_dates: Vec::new(),
         });
     }
@@ -301,6 +342,84 @@ pub fn import_courses(json: &str) -> Result<Vec<Course>, String> {
         c.color = col;
     }
     Ok(out)
+}
+
+/// 从 AI 回复里抠出真正要解析的 JSON：容忍 ```json 代码块和前后寒暄文字。
+/// AI 经常回「好的，这是你的课表：```json {...}``` 如需调整告诉我」，
+/// 直接整段塞给 serde 会失败，所以先把 JSON 本体摘出来。
+pub fn extract_reply_json(reply: &str) -> Result<String, String> {
+    let s = reply.trim();
+    if s.is_empty() {
+        return Err("先把 AI 的回复粘贴进来，再点导入".into());
+    }
+    // 优先取 Markdown 代码块（```json 或 ``` 都认）
+    if let Some(pos) = s.find("```") {
+        let after = &s[pos + 3..];
+        let body = after.find('\n').map(|i| &after[i + 1..]).unwrap_or(after);
+        if let Some(end) = body.find("```") {
+            let block = body[..end].trim();
+            if block.starts_with('{') || block.starts_with('[') {
+                return Ok(block.to_string());
+            }
+        }
+    }
+    // 否则扫描所有成对的花括号：说明文字里可能也有 {...}，
+    // 逐个试解析，只认「能解析、且是数组或含 courses」的那一段。
+    let candidates = json_slices(s);
+    for cand in &candidates {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(cand) {
+            if v.is_array() || v.get("courses").is_some() {
+                return Ok(cand.to_string());
+            }
+        }
+    }
+    // 一个都没通过校验时，把第一个候选交给解析函数，让报错更具体
+    if let Some(first) = candidates.first() {
+        return Ok(first.to_string());
+    }
+    Err("没在粘贴内容里找到课程 JSON，请确认 AI 回复里有课表数据".into())
+}
+
+/// 找出一段文本里所有顶层配对的 JSON 对象 / 数组（忽略字符串里的括号）。
+fn json_slices(s: &str) -> Vec<&str> {
+    let b = s.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] != b'{' && b[i] != b'[' { i += 1; continue; }
+        let mut depth = 0i32;
+        let mut in_str = false;
+        let mut escaped = false;
+        let mut end = None;
+        for (j, &ch) in b[i..].iter().enumerate() {
+            if in_str {
+                if escaped { escaped = false; }
+                else if ch == b'\\' { escaped = true; }
+                else if ch == b'"' { in_str = false; }
+                continue;
+            }
+            match ch {
+                b'"' => in_str = true,
+                b'{' | b'[' => depth += 1,
+                b'}' | b']' => {
+                    depth -= 1;
+                    if depth == 0 { end = Some(i + j + 1); break; }
+                }
+                _ => {}
+            }
+        }
+        match end {
+            Some(e) => { out.push(&s[i..e]); i = e; }
+            None => i += 1,
+        }
+    }
+    out
+}
+
+/// 粘贴 AI 回复 → 直接解析成课表（省掉手动存文件那一步）。
+pub fn import_courses_from_reply(reply: &str) -> Result<Vec<Course>, String> {
+    let json = extract_reply_json(reply)?;
+    import_courses(&json)
 }
 
 fn data_path() -> PathBuf {
@@ -461,7 +580,7 @@ mod clear_day_tests {
     }
     fn course(id: u64, weekday: u8) -> Course {
         Course { id, name: format!("c{}", id), weekday, start: "08:00".into(), end: "09:00".into(),
-                 place: String::new(), start_date: String::new(), end_date: String::new(),
+                 place: String::new(), keyword: String::new(), start_date: String::new(), end_date: String::new(),
                  color: default_course_color(), skip_dates: Vec::new() }
     }
 
@@ -514,5 +633,86 @@ mod clear_day_tests {
         assert!(db.restore_day_courses(d));
         assert_eq!(db.courses_on(wd, &k).len(), 1);
         assert!(!db.restore_day_courses(d));
+    }
+}
+
+#[cfg(test)]
+mod import_tests {
+    use super::*;
+
+    #[test]
+    fn prompt_covers_semantic_keywords_and_import_schema() {
+        let p = course_import_prompt();
+        assert!(p.contains("keyword"));
+        assert!(p.contains("语义"));
+        assert!(p.contains("weekday"));
+        assert!(p.contains("place"));
+        assert!(p.contains("courses"));
+    }
+
+    #[test]
+    fn import_reads_keyword_place_and_semantic_tag_alias() {
+        let json = r#"{"courses":[
+            {"name":"高等数学","weekday":1,"start":"08:00","end":"09:40","place":"A301","keyword":"高数"},
+            {"name":"模拟电子技术基础","day":3,"start":"14:00","end":"15:40","place":"实验楼201","tag":"模电"}
+        ]}"#;
+        let cs = import_courses(json).unwrap();
+        assert_eq!(cs.len(), 2);
+        assert_eq!(cs[0].keyword, "高数");
+        assert_eq!(cs[0].place, "A301");
+        assert_eq!(cs[1].keyword, "模电");
+        assert_eq!(cs[1].weekday, 3);
+        assert_eq!(cs[1].place, "实验楼201");
+    }
+
+    #[test]
+    fn prompt_example_itself_imports_cleanly() {
+        let p = course_import_prompt();
+        let start = p.find("{\n  \"courses\"").expect("提示词里应有示例 JSON");
+        let end = start + p[start..].find("\n}").expect("示例 JSON 应有结尾") + 2;
+        let json = &p[start..end];
+        let cs = import_courses(json).expect("提示词示例必须能直接导入");
+        assert_eq!(cs.len(), 2);
+        assert!(cs.iter().all(|c| !c.keyword.is_empty()), "示例每条都该带语义关键词");
+        assert!(cs.iter().all(|c| !c.place.is_empty()), "示例每条都该带地点");
+        assert_eq!(course_label(&cs[0]), "高数");
+        assert_eq!(course_label(&cs[1]), "模电");
+    }
+
+    #[test]
+    fn pasted_reply_with_code_fence_imports() {
+        let reply = r#"好的，已按你的课表整理：
+```json
+{"courses":[{"name":"高等数学","weekday":1,"start":"08:00","end":"09:40","keyword":"高数"}]}
+```
+如果还要调整告诉我。"#;
+        let cs = import_courses_from_reply(reply).expect("代码块里的 JSON 应能直接导入");
+        assert_eq!(cs.len(), 1);
+        assert_eq!(cs[0].keyword, "高数");
+    }
+
+    #[test]
+    fn pasted_reply_with_chatter_and_braces_imports() {
+        // 前后寒暄 + 说明文字里带花括号 + 地点名里也有花括号，都不能干扰提取
+        let reply = r#"这是结果（格式为 {"courses":[...]}，注意 start/end）：
+        {
+          "courses": [
+            {"name":"模电","weekday":3,"start":"14:00","end":"15:40","place":"实验楼{201}","keyword":"模电"}
+          ]
+        }
+        需要和我说。"#;
+        let cs = import_courses_from_reply(reply).expect("带说明文字的 JSON 应能提取");
+        assert_eq!(cs.len(), 1);
+        assert_eq!(cs[0].place, "实验楼{201}");
+    }
+
+    #[test]
+    fn pasted_reply_without_json_reports_friendly_error() {
+        let e = match import_courses_from_reply("抱歉，我没看懂这张课表") {
+            Ok(_) => panic!("这段回复里没有课表，应该报错"),
+            Err(e) => e,
+        };
+        assert!(e.contains("JSON"));
+        assert!(import_courses_from_reply("   ").is_err());
     }
 }

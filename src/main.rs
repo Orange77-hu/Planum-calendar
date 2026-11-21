@@ -141,6 +141,14 @@ fn skins() -> &'static [Palette] {
         pal!("星黛", true, "#0d0b16", "#171328", "#201a35", "#36304f", "#4d4470",
              "#f4f0ff", "#d5cced", "#9e93bd", "#b18cff", "#d9c6ff", "#1a1030",
              "#8ecae6", "#86e0c0", "#9a90b5"),
+        // 青瓷 · 淡碧（第三套浅色：瓷白底 + 青瓷绿强调，清爽安静）
+        pal!("青瓷", false, "#eef6f3", "#ffffff", "#f5fbf8", "#cfe2dc", "#a6c9be",
+             "#16302a", "#34564d", "#5e7a71", "#0f8f7a", "#0a6b5b", "#ffffff",
+             "#0e7490", "#0f9b83", "#8aa79f"),
+        // 樱雾 · 浅粉（第四套浅色：樱粉白底 + 玫瑰粉强调，柔和清新）
+        pal!("樱雾", false, "#fdf5f8", "#ffffff", "#fbeef4", "#eddbe4", "#dcbfd0",
+             "#392634", "#64495c", "#91788a", "#d4548a", "#a83266", "#ffffff",
+             "#0e7490", "#0f9b83", "#9a8296"),
     ])
 }
 
@@ -205,8 +213,9 @@ fn ca(key: &str, a: u8) -> Color32 {
 /// 用真实配色做预览，比单色圆点更直观，也让换肤按钮手感更统一。
 fn skin_swatch(ui: &mut egui::Ui, skin: &Palette, selected: bool) -> egui::Response {
     let (rect, resp) = ui.allocate_exact_size(egui::vec2(26.0, 18.0), egui::Sense::click());
-    // 悬停时占满格子、平时内缩 1px，形成柔和的“抬升”反馈
-    let r = if resp.hovered() { rect } else { rect.shrink(1.0) };
+    // 悬停用缓动动画过渡（约 0.15s），不再一瞬间跳变，手感更柔和自然
+    let hover_t = ui.ctx().animate_bool(ui.id().with("skin_swatch").with(skin.name), resp.hovered());
+    let r = rect.shrink(1.0 - hover_t);
     let p = ui.painter();
     let round = Rounding::same(radius::XS);
     // 底色 → 内层面板 → 底部主色条
@@ -316,11 +325,17 @@ struct App {
     course_start: String,
     course_end: String,
     course_place: String,
+    course_keyword: String,
     course_start_date: String,
     course_end_date: String,
     course_color: [f32; 3],
     course_slot_idx: usize,
     focus_course: bool,
+    // AI 课表导入提示词弹窗
+    prompt_open: bool,
+    // 粘贴 AI 回复直接导入（免去手动存文件）
+    paste_text: String,
+    paste_msg: String,
     // 时间段设置面板
     slot_open: bool,
     slot_draft: Vec<(String, String)>,
@@ -460,11 +475,15 @@ impl App {
             course_start: "08:00".into(),
             course_end: "09:40".into(),
             course_place: String::new(),
+            course_keyword: String::new(),
             course_start_date: String::new(),
             course_end_date: String::new(),
             course_color: data::default_course_color(),
             course_slot_idx: 0,
             focus_course: false,
+            prompt_open: false,
+            paste_text: String::new(),
+            paste_msg: String::new(),
             slot_open: false,
             slot_draft: Vec::new(),
             picker: None,
@@ -576,6 +595,7 @@ impl App {
                     .unwrap_or(0);
                 self.course_name = c.name; self.course_wd = c.weekday;
                 self.course_start = c.start; self.course_end = c.end; self.course_place = c.place;
+                self.course_keyword = c.keyword.clone();
                 self.course_start_date = c.start_date.clone(); self.course_end_date = c.end_date.clone();
             }
         } else {
@@ -585,6 +605,7 @@ impl App {
             self.course_start = slots.get(0).map(|x| x.start.clone()).unwrap_or_else(|| "08:00".into());
             self.course_end = slots.get(0).map(|x| x.end.clone()).unwrap_or_else(|| "09:40".into());
             self.course_place.clear();
+            self.course_keyword.clear();
             self.course_start_date.clear(); self.course_end_date.clear();
             self.course_color = data::default_course_color();
         }
@@ -599,6 +620,7 @@ impl App {
             if let Some(c) = self.db.courses.iter_mut().find(|c| c.id == id) {
                 c.name = name.to_string(); c.weekday = self.course_wd;
                 c.start = st; c.end = en; c.place = self.course_place.trim().to_string();
+                c.keyword = self.course_keyword.trim().to_string();
                 c.start_date = self.course_start_date.trim().to_string();
                 c.end_date = self.course_end_date.trim().to_string();
                 c.color = self.course_color;
@@ -611,6 +633,7 @@ impl App {
                 id: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64,
                 name: name.to_string(), weekday: self.course_wd, start: st, end: en,
                 place: self.course_place.trim().to_string(),
+                keyword: self.course_keyword.trim().to_string(),
                 start_date: self.course_start_date.trim().to_string(),
                 end_date: self.course_end_date.trim().to_string(), color: col,
                 skip_dates: Vec::new(),
@@ -631,6 +654,24 @@ impl App {
                     Err(e) => self.io_msg = format!("课表解析失败: {}", e),
                 },
                 Err(e) => self.io_msg = format!("读取失败: {}", e),
+            }
+        }
+    }
+
+    /// 把粘贴框里的 AI 回复直接解析导入，免去「存成 .json 再选文件」那一步
+    fn import_ai_reply(&mut self) {
+        match data::import_courses_from_reply(&self.paste_text) {
+            Ok(mut cs) => {
+                let n = cs.len();
+                self.db.courses.append(&mut cs);
+                self.paste_text.clear();
+                self.paste_msg = format!("已直接导入 {} 节课，无需另存文件", n);
+                self.io_msg = self.paste_msg.clone();
+                self.save_later();
+            }
+            Err(e) => {
+                self.paste_msg = format!("导入失败：{}", e);
+                self.io_msg = self.paste_msg.clone();
             }
         }
     }
@@ -774,6 +815,15 @@ fn setup_style(ctx: &egui::Context) {
         v.widgets.noninteractive.rounding = r;
         v.selection.bg_fill = ca(theme::ACCENT, 70);
         v.selection.stroke = Stroke::new(1.0_f32, c(theme::ACCENT));
+        // 弹窗 / 提示条：更柔的投影与圆角，浮层出现时不生硬
+        v.window_shadow = egui::epaint::Shadow {
+            offset: Vec2::new(0.0, 4.0), blur: 14.0, spread: 0.0,
+            color: ca(theme::BG, 110),
+        };
+        v.popup_shadow = egui::epaint::Shadow {
+            offset: Vec2::new(0.0, 3.0), blur: 10.0, spread: 0.0,
+            color: ca(theme::BG, 90),
+        };
         v.window_rounding = Rounding::same(radius::LG);
         style.visuals = v;
     });
@@ -846,9 +896,11 @@ impl eframe::App for App {
                 // egui 的 Frame 背景 = content_ui.min_rect()（内容宽度），长文字换行后 min_rect
                 // 不超出 left_rect，背景停在左栏内，gap 露出 BG，两栏自然分开。
                 let gap = 28.0f32;
-                // 左栏加宽到 312，把「阶段计划」行的＋新建按钮完整包进面板内；
-                // right_left 由 left_w 算出，中缝与右栏左缘随之同步右移，右栏相应变窄。
-                let left_w = 352.0f32.min(area.width() * 0.40).max(220.0);
+                // 左栏宽度随窗口一起缩放：以内容宽的 25% 为基准（默认 1420 窗口≈347px），
+                // 这样缩小窗口时左右两栏会一起收窄，而不是只压缩右栏。
+                // 上限 352 防止超宽屏过胖，下限 220 保证日期与左侧表单仍可读。
+                // right_left 由 left_w 算出，中缝与右栏左缘随之同步移动。
+                let left_w = 352.0f32.min(area.width() * 0.25).max(220.0);
                 // 表单可用宽 = 左栏宽 − 左右内边距(18×2) − 滚动条余量(16)，保证表单背景不出面板
                 self.left_form_max_w = (left_w - 52.0).max(168.0);
                 // 左栏起点回到 area.min.x（比上次右移 20px），宽度减 20 → 左栏右缘不变、栏体变窄
@@ -1386,50 +1438,70 @@ impl App {
                             }
                         }
                         if ui.button("导入日程…").on_hover_text("从 JSON 导入每周重复日程").clicked() { self.import_courses(); }
-                        if ui.button("课表模板…").on_hover_text("导出一份带示例的课表 JSON").clicked() {
-                            let tpl = r#"{
-  "courses": [
-    {
-      "name": "高等数学",
-      "weekday": 1,
-      "start": "08:00",
-      "end": "09:40",
-      "place": "A301",
-      "start_date": "2026-09-01",
-      "end_date": "2027-01-15"
-    },
-    {
-      "name": "英语二",
-      "weekday": 2,
-      "start": "10:00",
-      "end": "11:40",
-      "place": "B205",
-      "start_date": "",
-      "end_date": ""
-    },
-    {
-      "name": "模电",
-      "day": 3,
-      "start": "14:00",
-      "end": "15:40",
-      "place": "实验楼 201"
-    }
-  ]
-}
-"#;
-                            if let Some(path) = rfd::FileDialog::new().set_title("保存课表模板").set_file_name("planum_courses.json")
-                                .add_filter("JSON", &["json"]).save_file() {
-                                match std::fs::write(&path, tpl) {
-                                    Ok(_) => self.io_msg = "模板已保存：weekday 0=周日..6=周六（或用 day 1=周一..7=周日）；start/end 是每天时段；start_date/end_date 是生效日期范围，留空=永久".into(),
-                                    Err(e) => self.io_msg = format!("保存失败: {}", e),
-                                }
-                            }
+                        if ui.button("AI 导入提示词…").on_hover_text("复制提示词，连同课表文件发给 AI，就能得到可直接导入的 JSON").clicked() {
+                            self.prompt_open = true;
                         }
                         if ui.button("×").clicked() { self.io_open = false; }
                     });
                     if !self.io_msg.is_empty() {
                         ui.label(RichText::new(&self.io_msg).size(10.5).color(c(theme::MINT)));
                     }
+                });
+        }
+        // ── AI 课表导入提示词：复制后连同课表文件发给 AI，直接得到可导入的 JSON ──
+        if self.prompt_open {
+            egui::Window::new("AI 导入提示词")
+                .resizable(true)
+                .collapsible(false)
+                .default_size(Vec2::new(640.0, 640.0))
+                .min_size(Vec2::new(420.0, 420.0))
+                .show(ui.ctx(), |ui| {
+                    ui.label(RichText::new("怎么用").size(12.0).strong().color(c(theme::ACCENT2)));
+                    ui.label(RichText::new("① 复制下面的提示词 → ② 把课表文件（截图 / 照片 / PDF / 文字）和提示词一起发给 AI → ③ 把 AI 的回复整段粘到下方 → ④ 点「粘贴并导入」，不用再存成文件。")
+                        .size(11.0).color(c(theme::TEXT2)));
+                    ui.add_space(3.0);
+                    section_rule(ui);
+                    egui::ScrollArea::vertical().auto_shrink(false).max_height(210.0).show(ui, |ui| {
+                        egui::Frame::none().fill(c(theme::BG)).rounding(Rounding::same(radius::XS))
+                            .inner_margin(Margin::symmetric(8.0, 8.0)).show(ui, |ui| {
+                                ui.label(RichText::new(data::course_import_prompt())
+                                    .size(11.0).color(c(theme::TEXT2)));
+                            });
+                    });
+                    ui.add_space(3.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("复制提示词").on_hover_text("复制到剪贴板").clicked() {
+                            ui.ctx().copy_text(data::course_import_prompt().to_string());
+                            self.io_msg = "提示词已复制，连同课表文件发给 AI 即可".into();
+                        }
+                    });
+                    ui.add_space(4.0);
+                    section_rule(ui);
+                    ui.label(RichText::new("粘贴 AI 回复，直接导入")
+                        .size(12.0).strong().color(c(theme::ACCENT2)));
+                    ui.label(RichText::new("带代码块或前后说明文字都能识别，不用再另存 .json 文件。")
+                        .size(11.0).color(c(theme::TEXT3)));
+                    ui.add(egui::TextEdit::multiline(&mut self.paste_text)
+                        .desired_width(f32::INFINITY)
+                        .desired_rows(5)
+                        .hint_text("把 AI 回复的整段文字粘到这里（Ctrl+V）…"));
+                    if !self.paste_msg.is_empty() {
+                        let is_err = self.paste_msg.starts_with("导入失败");
+                        ui.label(RichText::new(&self.paste_msg).size(11.0)
+                            .color(if is_err { c(theme::ACCENT2) } else { c(theme::MINT) }));
+                    }
+                    ui.horizontal(|ui| {
+                        if ui.button("粘贴并导入").on_hover_text("直接读取上面粘贴的回复并导入课程").clicked() {
+                            self.import_ai_reply();
+                        }
+                        if ui.button("清空").clicked() {
+                            self.paste_text.clear();
+                            self.paste_msg.clear();
+                        }
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.button("关闭").clicked() { self.prompt_open = false; }
+                        });
+                    });
                 });
         }
         // ── 课程表单 ──
@@ -1463,6 +1535,13 @@ impl App {
                             }
                         });
                         ui.add(egui::TextEdit::singleline(&mut self.course_place).hint_text("地点").desired_width(70.0));
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("关键词:").size(11.0).color(c(theme::TEXT3)));
+                        ui.add(egui::TextEdit::singleline(&mut self.course_keyword)
+                            .hint_text("选填，如 高数 / 模电 / 线代").desired_width(160.0))
+                            .on_hover_text("按语义填 2~6 个字的短标签，日历小方块会显示它；留空则显示课程全名");
+                        ui.label(RichText::new("留空则日历方块显示课程全名").size(9.5).color(c(theme::TEXT3)));
                     });
                     ui.horizontal(|ui| {
                         ui.label(RichText::new("生效日期:").size(11.0).color(c(theme::TEXT3)));
@@ -1673,7 +1752,7 @@ impl App {
             let mut items: Vec<Item> = Vec::new();
             for co in self.db.courses_on(wd, &dk) {
                 items.push(Item { id: co.id, start: co.start.clone(), end: co.end.clone(),
-                    text: co.name.clone(), color: rgb(co.color), is_course: true });
+                    text: data::course_label(co), color: rgb(co.color), is_course: true });
             }
             for t in self.db.todos_of(&dk) {
                 if !t.start.is_empty() {
@@ -1879,7 +1958,7 @@ impl App {
                     let fade = |col: Color32, a: u8| Color32::from_rgba_unmultiplied(col.r(), col.g(), col.b(), a);
                     let mut daily: Vec<(String, Color32, bool)> = Vec::new();
                     for co in self.db.courses_on(d.weekday().num_days_from_sunday() as u8, &k) {
-                        daily.push((co.name.clone(), rgb(co.color), false));   // 日程（课程）
+                        daily.push((data::course_label(co), rgb(co.color), false));   // 日程（课程）
                     }
                     for t in todos.iter() {
                         let col = if t.done { c(theme::DONE) } else { rgb(prio_color(t.prio)) };
@@ -2188,15 +2267,16 @@ impl App {
         let ui = &mut cols[1];
         ui.label(RichText::new("每日日程表").size(12.0).strong().color(c(theme::MINT)));
             // 课程 + 带时段待办，按开始时间排序
-            #[derive(Clone)] struct Row { start: String, end: String, text: String, col: Color32, course: bool, id: u64 }
+            #[derive(Clone)] struct Row { start: String, end: String, text: String, place: String, col: Color32, course: bool, id: u64 }
             let mut rows: Vec<Row> = Vec::new();
             for c0 in self.db.courses_on(self.selected.weekday().num_days_from_sunday() as u8, &k) {
                 rows.push(Row { start:c0.start.clone(), end:c0.end.clone(), text:c0.name.clone(),
-                    col:rgb(c0.color), course:true, id:c0.id });
+                    place:c0.place.clone(), col:rgb(c0.color), course:true, id:c0.id });
             }
             for t in self.db.todos_of(&k) {
                 if !t.start.is_empty() {
                     rows.push(Row { start:t.start.clone(), end:t.end.clone(), text:t.text.clone(),
+                        place:String::new(),
                         col:if t.done { c(theme::DONE) } else { rgb(prio_color(t.prio)) }, course:false, id:t.id });
                 }
             }
@@ -2213,8 +2293,21 @@ impl App {
                     // 手绘小色条代替 ▮/▪ 字符（字符会被渲染成实心方块像乱码）
                     let bar = ui.allocate_response(Vec2::new(3.0, 14.0), egui::Sense::hover()).rect;
                     ui.painter().rect_filled(bar, Rounding::same(1.5), r0.col);
-                    let txt = trunc_to_width(ui, &r0.text, FontId::proportional(11.0), (ui.available_width() - 90.0).max(40.0));
-                    ui.label(RichText::new(txt).size(11.5).color(r0.col).strong());
+                    // 地点也放进详情行：先量好「编辑」按钮与地点标签要占的宽度，课程名再按剩余宽度截断
+                    let place = r0.place.trim();
+                    let place_label = if place.is_empty() { String::new() } else { format!("· {}", place) };
+                    let btn_reserve = if r0.course { 46.0_f32 } else { 6.0_f32 };
+                    let place_w = if place_label.is_empty() { 0.0 } else {
+                        ui.fonts(|f| f.layout_no_wrap(place_label.clone(), FontId::proportional(10.5), Color32::WHITE)).rect.width()
+                    } + 6.0;
+                    let name_avail = (ui.available_width() - btn_reserve - place_w).max(40.0);
+                    let txt = trunc_to_width(ui, &r0.text, FontId::proportional(11.0), name_avail);
+                    let name_resp = ui.label(RichText::new(txt).size(11.5).color(r0.col).strong());
+                    let full = if place.is_empty() { r0.text.clone() } else { format!("{} · {}", r0.text, place) };
+                    name_resp.on_hover_text(full);
+                    if !place_label.is_empty() && ui.available_width() > place_w + 44.0 {
+                        ui.label(RichText::new(place_label).size(10.5).color(c(theme::TEXT3)));
+                    }
                     if r0.course && ui.button("编辑").clicked() { edit_course_click = Some(r0.id); }
                 });
             }
@@ -2741,7 +2834,7 @@ mod skin_tests {
     #[test]
     fn every_skin_has_distinct_name_and_readable_text() {
         let list = skins();
-        assert!(list.len() >= 6, "应至少内置六套皮肤");
+        assert!(list.len() >= 8, "应至少内置八套皮肤");
         let mut names = std::collections::HashSet::new();
         for p in list {
             assert!(!p.name.is_empty() && names.insert(p.name), "皮肤名不能为空或重复");
