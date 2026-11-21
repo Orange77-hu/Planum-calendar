@@ -70,7 +70,7 @@ pub fn solar2lunar(date: &NaiveDate) -> Lunar {
     let mut is_leap = false;
     let mut m = 1u32;
     while m < 13 && offset > 0 {
-        let mut temp;
+        let temp;
         if leap > 0 && m == leap + 1 && !is_leap {
             m -= 1; is_leap = true; temp = leap_days(year) as i64;
         } else {

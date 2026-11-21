@@ -1,5 +1,5 @@
 // 数据层：待办 / 阶段计划 / 重点日，JSON 持久化
-use chrono::{Duration, NaiveDate};
+use chrono::{Datelike, Duration, NaiveDate};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
@@ -20,6 +20,8 @@ pub struct Todo {
     /// 时段起止 "HH:MM"，空串表示全天任务
     #[serde(default)] pub start: String,
     #[serde(default)] pub end: String,
+    /// 卡片上显示的关键词（空则用事项文字）
+    #[serde(default)] pub keyword: String,
 }
 
 /// 每周重复课程
@@ -37,6 +39,8 @@ pub struct Course {
     #[serde(default)] pub end_date: String,
     /// 日程颜色 rgb 0..1（同名课程同色）
     #[serde(default = "default_course_color")] pub color: [f32; 3],
+    /// 单日排除：月视图右键「清空当天的每日计划和日程」只跳过这一天，不删除整门周重复课程
+    #[serde(default)] pub skip_dates: Vec<String>,
 }
 
 /// 周视图时间段卡片（所有天共用同一组，数量可自定义）
@@ -79,6 +83,8 @@ pub struct Db {
     #[serde(default)] pub default_week_view: bool,
     /// 周视图时段卡片文字：true=居中, false=左对齐
     #[serde(default = "default_card_center")] pub card_center: bool,
+    /// 当前皮肤序号（0=曜夜，1=晨雾，2=森屿，3=霞光，4=深海）
+    #[serde(default)] pub skin: usize,
 }
 
 impl Db {
@@ -87,14 +93,14 @@ impl Db {
         let dk = |n: i64| dkey(&(today + Duration::days(n)));
         let mut db = Db {
             todos: vec![
-                Todo { id:101, date:dk(0), text:"评审新版首页设计稿".into(), prio:1, done:false, start:String::new(), end:String::new() },
-                Todo { id:102, date:dk(0), text:"整理本周迭代待办".into(), prio:2, done:false, start:String::new(), end:String::new() },
-                Todo { id:103, date:dk(0), text:"晨间运动 30 分钟".into(), prio:3, done:true,  start:String::new(), end:String::new() },
-                Todo { id:104, date:dk(1), text:"和产品对齐下季度路线".into(), prio:1, done:false, start:String::new(), end:String::new() },
-                Todo { id:105, date:dk(2), text:"周会材料准备".into(), prio:2, done:false, start:String::new(), end:String::new() },
-                Todo { id:106, date:dk(4), text:"月度复盘报告初稿".into(), prio:1, done:false, start:String::new(), end:String::new() },
-                Todo { id:107, date:dk(6), text:"整理书桌与工位".into(), prio:3, done:false, start:String::new(), end:String::new() },
-                Todo { id:108, date:dk(-1),text:"提交费用报销".into(), prio:2, done:true,  start:String::new(), end:String::new() },
+                Todo { id:101, date:dk(0), text:"评审新版首页设计稿".into(), prio:1, done:false, start:String::new(), end:String::new(), keyword:"设计稿".into() },
+                Todo { id:102, date:dk(0), text:"整理本周迭代待办".into(), prio:2, done:false, start:String::new(), end:String::new(), keyword:"迭代".into() },
+                Todo { id:103, date:dk(0), text:"晨间运动 30 分钟".into(), prio:3, done:true,  start:String::new(), end:String::new(), keyword:"运动".into() },
+                Todo { id:104, date:dk(1), text:"和产品对齐下季度路线".into(), prio:1, done:false, start:String::new(), end:String::new(), keyword:"路线".into() },
+                Todo { id:105, date:dk(2), text:"周会材料准备".into(), prio:2, done:false, start:String::new(), end:String::new(), keyword:"周会".into() },
+                Todo { id:106, date:dk(4), text:"月度复盘报告初稿".into(), prio:1, done:false, start:String::new(), end:String::new(), keyword:"复盘".into() },
+                Todo { id:107, date:dk(6), text:"整理书桌与工位".into(), prio:3, done:false, start:String::new(), end:String::new(), keyword:"整理".into() },
+                Todo { id:108, date:dk(-1),text:"提交费用报销".into(), prio:2, done:true,  start:String::new(), end:String::new(), keyword:"报销".into() },
             ],
             mark_notes: HashMap::new(),
             plans: vec![
@@ -110,6 +116,7 @@ impl Db {
             week_start_sunday: false,
             default_week_view: false,
             card_center: true,
+            skin: 0,
         };
         db.marks.insert(dk(1), true);
         db.marks.insert(dk(4), true);
@@ -139,6 +146,8 @@ impl Db {
     pub fn courses_on(&self, weekday: u8, date_key: &str) -> Vec<&Course> {
         let mut v: Vec<&Course> = self.courses.iter().filter(|c| {
             if c.weekday != weekday { return false; }
+            // 被「清空当天日程」排除过的日期不再显示（课程本身保留，其它周照常）
+            if c.skip_dates.iter().any(|s| s.as_str() == date_key) { return false; }
             if date_key.is_empty() { return true; }
             if !c.start_date.is_empty() && date_key < c.start_date.as_str() { return false; }
             if !c.end_date.is_empty() && date_key > c.end_date.as_str() { return false; }
@@ -155,6 +164,70 @@ impl Db {
         let mut v: Vec<&Plan> = self.plans.iter().filter(|p| p.start.as_str() <= k && k <= p.end.as_str()).collect();
         v.sort_by(|a,b| a.start.cmp(&b.start));
         v
+    }
+
+    /// 清空某天的阶段计划：只把这一天从日期区间里挖掉，必要时拆成前后两段。
+    /// 返回是否真的改动了数据，方便调用方决定何时写盘。
+    pub fn clear_day_plans(&mut self, d: NaiveDate) -> bool {
+        let k = dkey(&d);
+        let k_prev = dkey(&(d - Duration::days(1)));
+        let k_next = dkey(&(d + Duration::days(1)));
+        let mut next_id = self.plans.iter().map(|p| p.id).max().unwrap_or(0) + 1;
+        let mut out: Vec<Plan> = Vec::new();
+        let mut changed = false;
+        for p in self.plans.iter().cloned() {
+            if p.start.as_str() <= k.as_str() && k.as_str() <= p.end.as_str() {
+                changed = true;
+                if p.start.as_str() < k.as_str() {
+                    let mut left = p.clone();
+                    left.end = k_prev.clone();
+                    out.push(left);
+                }
+                if k.as_str() < p.end.as_str() {
+                    let mut right = p.clone();
+                    right.start = k_next.clone();
+                    // 左边那段沿用了原 id，右边这段另给一个新 id，保证编辑互不串台
+                    if p.start.as_str() < k.as_str() { right.id = next_id; next_id += 1; }
+                    out.push(right);
+                }
+            } else {
+                out.push(p);
+            }
+        }
+        if changed { self.plans = out; }
+        changed
+    }
+
+    /// 清空某天的每日计划和日程：当天待办按日期删除；周重复课程只跳过这一天，
+    /// 课程本身和其它周都保留（可用 restore_day_courses 恢复）。
+    pub fn clear_day_todos(&mut self, d: NaiveDate) -> bool {
+        let k = dkey(&d);
+        let before = self.todos.len();
+        self.todos.retain(|t| t.date != k);
+        let mut changed = before != self.todos.len();
+        let wd = d.weekday().num_days_from_sunday() as u8;
+        for c in self.courses.iter_mut() {
+            if c.weekday == wd
+                && (c.start_date.is_empty() || c.start_date.as_str() <= k.as_str())
+                && (c.end_date.is_empty() || k.as_str() <= c.end_date.as_str())
+                && !c.skip_dates.iter().any(|s| s.as_str() == k.as_str()) {
+                c.skip_dates.push(k.clone());
+                changed = true;
+            }
+        }
+        changed
+    }
+
+    /// 恢复某天被「清空」的周重复课程。
+    pub fn restore_day_courses(&mut self, d: NaiveDate) -> bool {
+        let k = dkey(&d);
+        let mut changed = false;
+        for c in self.courses.iter_mut() {
+            let before = c.skip_dates.len();
+            c.skip_dates.retain(|s| s.as_str() != k.as_str());
+            changed |= before != c.skip_dates.len();
+        }
+        changed
     }
 }
 
@@ -214,7 +287,7 @@ pub fn import_courses(json: &str) -> Result<Vec<Course>, String> {
             id: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64 + i as u64,
             name: name.to_string(), weekday, start, end,
             place: place.to_string(), start_date: sd.to_string(), end_date: ed.to_string(),
-            color: default_course_color(),
+            color: default_course_color(), skip_dates: Vec::new(),
         });
     }
     if out.is_empty() { return Err("未解析到有效日程（需 name/start/end）".into()); }
@@ -260,13 +333,6 @@ pub fn prio_color(p: u8) -> [f32;3] {
     match p { 1 => [1.0,0.49,0.41], 3 => [0.50,0.70,0.88], _ => [0.95,0.63,0.29] }
 }
 
-
-/// 导出文件目录（数据目录下 exports）
-pub fn export_dir() -> PathBuf {
-    let p = data_path().parent().unwrap_or_else(|| std::path::Path::new(".")).join("exports");
-    let _ = fs::create_dir_all(&p);
-    p
-}
 
 /// 按范围过滤待办。scope: day=精确日期, week=该日起7天, month=YYYY-MM, year=YYYY
 pub fn todos_in_scope(db: &Db, scope: &str, center: NaiveDate) -> Vec<Todo> {
@@ -379,4 +445,74 @@ pub fn export_markdown(db: &Db, scope: &str, center: NaiveDate) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod clear_day_tests {
+    use super::*;
+    use chrono::Datelike;
+
+    fn todo(id: u64, date: &str) -> Todo {
+        Todo { id, date: date.into(), text: format!("t{}", id), prio: 1, done: false,
+               start: String::new(), end: String::new(), keyword: String::new() }
+    }
+    fn plan(id: u64, start: &str, end: &str) -> Plan {
+        Plan { id, name: format!("p{}", id), color: [0.5, 0.5, 0.5], start: start.into(), end: end.into() }
+    }
+    fn course(id: u64, weekday: u8) -> Course {
+        Course { id, name: format!("c{}", id), weekday, start: "08:00".into(), end: "09:00".into(),
+                 place: String::new(), start_date: String::new(), end_date: String::new(),
+                 color: default_course_color(), skip_dates: Vec::new() }
+    }
+
+    #[test]
+    fn clearing_middle_day_splits_plan_and_keeps_other_days() {
+        let mut db = Db::default();
+        db.plans.push(plan(1, "2026-11-20", "2026-11-25"));
+        let mid = NaiveDate::from_ymd_opt(2026, 11, 22).unwrap();
+        assert!(db.clear_day_plans(mid));
+        assert_eq!(db.plans.len(), 2);
+        assert_eq!(db.plans[0].start, "2026-11-20");
+        assert_eq!(db.plans[0].end, "2026-11-21");
+        assert_eq!(db.plans[1].start, "2026-11-23");
+        assert_eq!(db.plans[1].end, "2026-11-25");
+        assert_ne!(db.plans[0].id, db.plans[1].id);
+        assert!(db.plans_on("2026-11-22").is_empty());
+        assert_eq!(db.plans_on("2026-11-24").len(), 1);
+        assert!(!db.clear_day_plans(mid)); // 已清空那天，再点不该改动
+    }
+
+    #[test]
+    fn clearing_edge_day_shrinks_plan_and_single_day_plan_disappears() {
+        let mut db = Db::default();
+        db.plans.push(plan(2, "2026-11-20", "2026-11-22"));
+        db.plans.push(plan(3, "2026-11-24", "2026-11-24"));
+        assert!(db.clear_day_plans(NaiveDate::from_ymd_opt(2026, 11, 20).unwrap()));
+        assert_eq!(db.plans.len(), 2);
+        assert_eq!(db.plans[0].start, "2026-11-21");
+        assert!(db.clear_day_plans(NaiveDate::from_ymd_opt(2026, 11, 24).unwrap()));
+        assert_eq!(db.plans.len(), 1);
+        assert!(db.plans.iter().all(|p| p.id != 3));
+    }
+
+    #[test]
+    fn clearing_day_todos_and_courses_is_day_scoped_and_reversible() {
+        let mut db = Db::default();
+        let d = NaiveDate::from_ymd_opt(2026, 11, 21).unwrap(); // 周六
+        let next = d + Duration::days(7);
+        db.todos.push(todo(1, &dkey(&d)));
+        db.todos.push(todo(2, &dkey(&next)));
+        let wd = d.weekday().num_days_from_sunday() as u8;
+        db.courses.push(course(9, wd));
+        let k = dkey(&d);
+        assert_eq!(db.courses_on(wd, &k).len(), 1);
+        assert!(db.clear_day_todos(d));
+        assert_eq!(db.todos.len(), 1);
+        assert_eq!(db.todos[0].date, dkey(&next));
+        assert!(db.courses_on(wd, &k).is_empty());
+        assert_eq!(db.courses_on(wd, &dkey(&next)).len(), 1); // 别的周照常显示
+        assert!(db.restore_day_courses(d));
+        assert_eq!(db.courses_on(wd, &k).len(), 1);
+        assert!(!db.restore_day_courses(d));
+    }
 }
