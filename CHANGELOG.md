@@ -2,6 +2,15 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/) 格式，版本号遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/)。
 
+## [1.2.3] - 2026-11-22
+
+### Added
+- 皮肤成套配置：白天 / 黑夜各挑一套，三种模式可选——「跟随系统明暗」（读 Windows 深色/浅色设置）、「按时段」（7:00–19:00 算白天）、「固定一套」；系统主题或时段变化时整窗平滑换肤，选择自动保存
+- 设置面板新增模式按钮、白天/黑夜两排真实配色预览与「当前皮肤」显示，切换模式即时生效
+
+### Changed
+- 皮肤选择统一为成套的两排预览块，浅色与深色搭配一眼看清；标题栏染色随自动换肤同步更新
+
 ## [1.2.2] - 2026-11-21
 
 ### Changed
@@ -88,6 +97,7 @@
 - 计划文字按格子实际像素宽度动态截断，窗口缩小不溢出
 - 高亮框支持多行文字整体框选，不遮挡优先级标签
 
+[1.2.3]: https://github.com/Orange77-hu/Planum-calendar/releases/tag/v1.2.3
 [1.2.2]: https://github.com/Orange77-hu/Planum-calendar/releases/tag/v1.2.2
 [1.2.1]: https://github.com/Orange77-hu/Planum-calendar/releases/tag/v1.2.1
 [1.2.0]: https://github.com/Orange77-hu/Planum-calendar/releases/tag/v1.2.0

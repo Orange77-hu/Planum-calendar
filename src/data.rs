@@ -85,8 +85,14 @@ pub struct Db {
     #[serde(default)] pub default_week_view: bool,
     /// 周视图时段卡片文字：true=居中, false=左对齐
     #[serde(default = "default_card_center")] pub card_center: bool,
-    /// 当前皮肤序号（0=曜夜，1=晨雾，2=森屿，3=霞光，4=深海，5=暖阳，6=星黛，7=青瓷）
+    /// 当前皮肤序号（兼容旧版；实际显示由下面的模式与白天/黑夜皮肤决定）
     #[serde(default)] pub skin: usize,
+    /// 皮肤模式：0=跟随系统明暗（默认）, 1=按本地时段（7:00–19:00 为白天）, 2=固定用 skin
+    #[serde(default)] pub skin_mode: u8,
+    /// 白天显示哪套皮肤（序号越界自动收敛到内置范围内）
+    #[serde(default = "default_day_skin")] pub day_skin: usize,
+    /// 黑夜显示哪套皮肤（序号越界自动收敛到内置范围内）
+    #[serde(default = "default_night_skin")] pub night_skin: usize,
 }
 
 impl Db {
@@ -119,6 +125,9 @@ impl Db {
             default_week_view: false,
             card_center: true,
             skin: 0,
+            skin_mode: 0,
+            day_skin: 1,
+            night_skin: 0,
         };
         db.marks.insert(dk(1), true);
         db.marks.insert(dk(4), true);
@@ -246,6 +255,9 @@ fn default_card_center() -> bool { true }
 fn default_plan_by_time() -> bool { false }
 fn default_schedule_by_time() -> bool { true }
 fn default_color_by_schedule() -> bool { true }
+/// 默认：白天用「晨雾」浅色，黑夜用「曜夜」深色
+fn default_day_skin() -> usize { 1 }
+fn default_night_skin() -> usize { 0 }
 
 /// 默认周视图时间段（上午两节 + 下午两节 + 晚上）
 pub fn default_slots() -> Vec<Slot> {

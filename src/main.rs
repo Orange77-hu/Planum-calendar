@@ -168,6 +168,38 @@ fn target_color(key: &str) -> Color32 {
 }
 /// 当前皮肤是否为深色（决定 egui 主题与标题栏文字明暗）
 fn skin_dark() -> bool { skins()[active_skin().min(skins().len() - 1)].dark }
+
+/// 按本地时段判断是否为夜晚：7:00–19:00 算白天，其余算夜晚
+fn night_by_clock() -> bool {
+    let h = Local::now().hour();
+    h >= 19 || h < 7
+}
+
+/// 当前是否应该按「夜晚」那套皮肤取色：
+/// 模式 0 跟随系统明暗（系统没上报时退回按时段），
+/// 模式 1 按本地时段，模式 2 固定一套（不区分白天黑夜）。
+fn is_night(db: &data::Db, ctx: &egui::Context) -> bool {
+    match db.skin_mode.min(2) {
+        0 => ctx.system_theme()
+                .map(|t| t == egui::Theme::Dark)
+                .unwrap_or_else(night_by_clock),
+        1 => night_by_clock(),
+        _ => false,
+    }
+}
+
+/// 按当前模式算出该显示哪一套皮肤（序号越界自动回退到第一套）
+fn skin_for(db: &data::Db, ctx: &egui::Context) -> usize {
+    let n = skins().len().max(1);
+    if db.skin_mode.min(2) == 2 {
+        db.skin.min(n - 1)
+    } else if is_night(db, ctx) {
+        db.night_skin.min(n - 1)
+    } else {
+        db.day_skin.min(n - 1)
+    }
+}
+
 /// 立即切换且不带淡入（启动时恢复已保存的皮肤，避免开场闪一下旧色）
 fn set_skin_now(i: usize) {
     let i = i.min(skins().len() - 1);
@@ -237,6 +269,24 @@ fn skin_swatch(ui: &mut egui::Ui, skin: &Palette, selected: bool) -> egui::Respo
     resp
 }
 
+/// 一排皮肤选择块：左边标签 + 9 个真实配色预览 + 当前皮肤名。
+/// 返回被点中的序号（没点则 None），由调用方决定改哪一个槽位。
+fn skin_pick_row(ui: &mut egui::Ui, label: &str, current: usize) -> Option<usize> {
+    let mut picked = None;
+    ui.horizontal(|ui| {
+        ui.label(RichText::new(label).size(11.0).color(c(theme::TEXT2)));
+        for (i, skin) in skins().iter().enumerate() {
+            if skin_swatch(ui, skin, i == current).on_hover_text(skin.name).clicked() {
+                picked = Some(i);
+            }
+        }
+        ui.add_space(2.0);
+        let name = skins()[current.min(skins().len() - 1)].name;
+        ui.label(RichText::new(name).size(11.0).strong().color(c(theme::ACCENT2)));
+    });
+    picked
+}
+
 mod theme {
     // 语义色键：实际颜色由当前皮肤决定
     pub const BG: &str        = "bg";
@@ -270,6 +320,10 @@ const WEEK_FULL: [&str;7] = ["星期日","星期一","星期二","星期三","�
 struct App {
     // 原生标题栏 DWM 染色（一次性）
     dwm_applied: bool,
+    // 按模式算出的目标皮肤；变化时自动换肤（避免每帧把手动预览冲掉）
+    auto_skin: usize,
+    // 首帧用系统主题校准皮肤时直接定稿，避免开场先闪另一套配色
+    skin_init: bool,
     db: Db,
     today: NaiveDate,
     view: NaiveDate,
@@ -411,7 +465,9 @@ impl App {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
         setup_fonts(&cc.egui_ctx);
         let db = data::load();
-        set_skin_now(db.skin); // 恢复上次选中的皮肤，再据此生成控件样式（无需淡入）
+        // 按保存的模式（跟随系统 / 按时段 / 固定）挑出启动皮肤，再据此生成控件样式（无需淡入）
+        let initial_skin = skin_for(&db, &cc.egui_ctx);
+        set_skin_now(initial_skin);
         setup_style(&cc.egui_ctx);
         let today = Local::now().date_naive();
         // 读取上次窗口几何（x,y,w,h,max），默认给一组合理值
@@ -433,6 +489,8 @@ impl App {
                          else { NaiveDate::from_ymd_opt(today.year(), today.month(), 1).unwrap() };
         Self {
             dwm_applied: false,
+            auto_skin: initial_skin,
+            skin_init: false,
             db,
             view: start_view,
             selected: today,
@@ -526,6 +584,15 @@ impl App {
     fn ease(t: f32) -> f32 { let t = t.clamp(0.0,1.0); 1.0 - (1.0-t)*(1.0-t)*(1.0-t) } // easeOutCubic
 
     fn save_later(&mut self) { self.pending_save = true; }
+
+    /// 设置面板点选皮肤：立刻平滑换肤（淡入由主循环推进），并记为目标皮肤
+    fn preview_skin(&mut self, i: usize, ctx: &egui::Context) {
+        self.auto_skin = i;
+        set_skin(i);
+        setup_style(ctx);
+        self.dwm_applied = false; // 标题栏按新皮肤重新染色
+        ctx.request_repaint();
+    }
 
     fn add_todo(&mut self) {
         let text = self.add_text.trim().to_string();
@@ -879,6 +946,21 @@ impl eframe::App for App {
         // 按真实帧间隔推进动画（丝滑关键：与帧率解耦）
         let t = self.last_frame.elapsed().as_secs_f32().min(0.1);
         self.last_frame = Instant::now();
+        // 皮肤自动切换：跟随系统明暗 / 按时段时，系统主题或时段变化会平滑换肤
+        let want_skin = skin_for(&self.db, ctx);
+        if want_skin != self.auto_skin {
+            self.auto_skin = want_skin;
+            if !self.skin_init {
+                set_skin_now(want_skin); // 首帧校准：直接定稿，不开场闪色
+                self.skin_init = true;
+            } else {
+                set_skin(want_skin);
+            }
+            setup_style(ctx);
+            self.dwm_applied = false; // 标题栏按新皮肤重新染色
+        } else {
+            self.skin_init = true;
+        }
         // 皮肤交叉淡入：过渡期间每帧同步刷新控件配色，全程平滑无跳变
         let fading = advance_skin(t);
         if fading { setup_style(ctx); }
@@ -1318,23 +1400,45 @@ impl App {
                             if ui.button("×").clicked() { self.io_open = false; }
                         });
                     });
-                    // ── 皮肤：一键换肤，整窗平滑淡入 ──
+                    // ── 皮肤：白天/黑夜成套配置 + 模式切换，整窗平滑淡入 ──
                     ui.horizontal(|ui| {
-                        ui.label(RichText::new("皮肤:").size(11.0).color(c(theme::TEXT2)));
-                        let cur = active_skin();
-                        for (i, skin) in skins().iter().enumerate() {
-                            let on = i == cur;
-                            if skin_swatch(ui, skin, on).on_hover_text(skin.name).clicked() {
-                                set_skin(i);
-                                self.db.skin = i;
+                        ui.label(RichText::new("模式:").size(11.0).color(c(theme::TEXT2)));
+                        for (m, nm, tip) in [
+                            (0u8, "跟随系统", "跟随 Windows 的深色 / 浅色模式，自动换肤"),
+                            (1u8, "按时段", "7:00–19:00 用白天皮肤，其余用黑夜皮肤"),
+                            (2u8, "固定一套", "始终使用下面选中的那一套皮肤"),
+                        ] {
+                            let b = egui::Button::new(RichText::new(nm).size(10.5));
+                            if ui.add(b.frame(self.db.skin_mode == m)).on_hover_text(tip).clicked() {
+                                self.db.skin_mode = m;
                                 self.save_later();
-                                self.dwm_applied = false; // 标题栏按新皮肤重新染色
-                                ui.ctx().request_repaint(); // 下一帧推进淡入
+                                let want = skin_for(&self.db, ui.ctx());
+                                self.preview_skin(want, ui.ctx());
                             }
                         }
-                        ui.add_space(2.0);
-                        ui.label(RichText::new(skins()[cur].name).size(11.0).strong().color(c(theme::ACCENT2)));
+                        ui.add_space(6.0);
+                        ui.label(RichText::new("当前:").size(11.0).color(c(theme::TEXT3)));
+                        let cur_name = skins()[active_skin().min(skins().len() - 1)].name;
+                        ui.label(RichText::new(cur_name).size(11.0).strong().color(c(theme::ACCENT2)));
                     });
+                    // 白天 / 黑夜各挑一套：跟随系统或按时段时自动切换；点当前正在用的那套会立即平滑换肤
+                    if self.db.skin_mode != 2 {
+                        let night_now = is_night(&self.db, ui.ctx());
+                        if let Some(i) = skin_pick_row(ui, "白天:", self.db.day_skin) {
+                            self.db.day_skin = i;
+                            self.save_later();
+                            if !night_now { self.preview_skin(i, ui.ctx()); }
+                        }
+                        if let Some(i) = skin_pick_row(ui, "黑夜:", self.db.night_skin) {
+                            self.db.night_skin = i;
+                            self.save_later();
+                            if night_now { self.preview_skin(i, ui.ctx()); }
+                        }
+                    } else if let Some(i) = skin_pick_row(ui, "固定:", self.db.skin) {
+                        self.db.skin = i;
+                        self.save_later();
+                        self.preview_skin(i, ui.ctx());
+                    }
                     section_rule(ui);
                     // 排序规则：每日计划 / 每日日程表各自独立
                     ui.horizontal(|ui| {
@@ -2868,6 +2972,32 @@ mod skin_tests {
         assert!(!advance_skin(1.0), "淡入结束后不应继续过渡");
         set_skin_now(0);
         assert_eq!(active_skin(), 0);
+    }
+
+    #[test]
+    fn skin_mode_picks_the_right_slot() {
+        let mut db = data::Db::seed();
+        let ctx = egui::Context::default();
+        db.skin = 3; db.day_skin = 5; db.night_skin = 6;
+
+        // 固定模式：始终用保存的那一套
+        db.skin_mode = 2;
+        assert_eq!(skin_for(&db, &ctx), 3);
+
+        // 按时段模式：7:00–19:00 用白天那套，其余用黑夜那套
+        db.skin_mode = 1;
+        let expect = if night_by_clock() { 6 } else { 5 };
+        assert_eq!(skin_for(&db, &ctx), expect);
+    }
+
+    #[test]
+    fn out_of_range_skin_slot_stays_in_range() {
+        let mut db = data::Db::seed();
+        let ctx = egui::Context::default();
+        db.skin_mode = 2; db.skin = 999;
+        assert_eq!(skin_for(&db, &ctx), skins().len() - 1);
+        db.skin_mode = 1; db.day_skin = 999; db.night_skin = 999;
+        assert!(skin_for(&db, &ctx) < skins().len());
     }
 }
 
